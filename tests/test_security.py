@@ -58,6 +58,7 @@ class SecurityValidationTests(unittest.TestCase):
         capabilities = server.capabilities()
         self.assertGreaterEqual(capabilities["inputFormatCount"], 40)
         self.assertGreaterEqual(capabilities["targetFormatCount"], 20)
+        self.assertGreaterEqual(capabilities["maxConcurrentConversions"], 1)
 
     def test_download_tokens_are_redacted_from_logs(self):
         text = (

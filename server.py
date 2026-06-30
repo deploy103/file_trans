@@ -49,6 +49,7 @@ MAX_OUTPUT_BYTES = int(os.environ.get("FILE_TRANS_MAX_OUTPUT", str(1024 * 1024 *
 MAX_PROCESS_MEMORY_BYTES = int(os.environ.get("FILE_TRANS_PROCESS_MEMORY", str(1024 * 1024 * 1024)))
 MAX_PROCESS_FILES = int(os.environ.get("FILE_TRANS_PROCESS_FILES", "128"))
 MAX_PROCESS_COUNT = int(os.environ.get("FILE_TRANS_PROCESS_COUNT", "96"))
+MAX_CONCURRENT_CONVERSIONS = int(os.environ.get("FILE_TRANS_MAX_CONCURRENT", "2"))
 MAX_ARCHIVE_MEMBERS = int(os.environ.get("FILE_TRANS_MAX_ARCHIVE_MEMBERS", "2000"))
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = int(
     os.environ.get("FILE_TRANS_MAX_ARCHIVE_UNCOMPRESSED", str(512 * 1024 * 1024))
@@ -177,6 +178,10 @@ class ConversionError(Exception):
     pass
 
 
+class ConversionBusyError(ConversionError):
+    pass
+
+
 @dataclass(frozen=True)
 class FileValidation:
     ext: str
@@ -208,6 +213,7 @@ class UploadRateLimiter:
 
 
 rate_limiter = UploadRateLimiter(RATE_LIMIT_WINDOW_SECONDS, RATE_LIMIT_MAX_UPLOADS)
+conversion_slots = threading.BoundedSemaphore(max(1, MAX_CONCURRENT_CONVERSIONS))
 
 
 def ensure_dirs() -> None:
@@ -440,6 +446,7 @@ def capabilities() -> dict:
         "targetFormatCount": len(ALLOWED_TARGET_EXTS),
         "maxUploadBytes": MAX_UPLOAD_BYTES,
         "maxConversionSeconds": MAX_CONVERSION_SECONDS,
+        "maxConcurrentConversions": max(1, MAX_CONCURRENT_CONVERSIONS),
         "resultTtlSeconds": RESULT_TTL_SECONDS,
     }
 
@@ -2120,11 +2127,15 @@ class FileTransHandler(BaseHTTPRequestHandler):
         error_status = HTTPStatus.BAD_REQUEST
         output_path = None
         metadata = None
+        conversion_slot_acquired = False
         try:
             size, digest = copy_stream_limited(file_item.file, input_path, MAX_UPLOAD_BYTES)
             source = validate_upload_file(input_path, original_name, size, digest)
             if target not in targets_for_extension(source.ext):
                 raise ConversionError(f".{source.ext} 파일은 .{target} 형식으로 변환할 수 없습니다.")
+            conversion_slot_acquired = conversion_slots.acquire(blocking=False)
+            if not conversion_slot_acquired:
+                raise ConversionBusyError("동시 변환 제한에 도달했습니다. 잠시 후 다시 시도하세요.")
             output_path = convert_file(input_path, original_name, target, job_output_dir)
             if output_path.stat().st_size > MAX_OUTPUT_BYTES:
                 raise ConversionError("변환 결과 파일 크기가 제한을 초과했습니다.")
@@ -2132,11 +2143,15 @@ class FileTransHandler(BaseHTTPRequestHandler):
         except ConversionError as exc:
             remove_tree(job_output_dir)
             error_message = str(exc)
+            if isinstance(exc, ConversionBusyError):
+                error_status = HTTPStatus.TOO_MANY_REQUESTS
         except Exception as exc:
             remove_tree(job_output_dir)
             error_message = f"변환 중 오류가 발생했습니다: {exc}"
             error_status = HTTPStatus.INTERNAL_SERVER_ERROR
         finally:
+            if conversion_slot_acquired:
+                conversion_slots.release()
             safe_unlink(input_path)
             remove_tree(job_upload_dir)
 
