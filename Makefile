@@ -1,4 +1,4 @@
-.PHONY: run run-docker-worker check build-tools build-worker install-deps clean
+.PHONY: run run-docker-worker check smoke-test build-tools build-worker install-deps clean
 
 HOST ?= 127.0.0.1
 PORT ?= 8000
@@ -12,6 +12,9 @@ run-docker-worker:
 
 check:
 	python3 -m py_compile server.py
+
+smoke-test:
+	bash scripts/smoke-test.sh
 
 build-tools:
 	bash scripts/build-toolchain.sh

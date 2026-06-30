@@ -8,11 +8,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
       ca-certificates \
+      calibre \
       ffmpeg \
       fonts-nanum \
       ghostscript \
       imagemagick \
       libreoffice \
+      pandoc \
       poppler-utils \
       python3 \
     && rm -rf /var/lib/apt/lists/*

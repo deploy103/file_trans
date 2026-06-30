@@ -11,6 +11,13 @@ make run
 
 기본 주소는 `http://127.0.0.1:8000`입니다.
 
+기본 동작 검증:
+
+```bash
+make check
+make smoke-test
+```
+
 변환기를 Docker worker 안에서 실행하려면 먼저 이미지를 빌드한 뒤 worker 모드로 실행합니다.
 
 ```bash
@@ -32,9 +39,11 @@ make install-deps
 - `libreoffice`: `hwp`, `docx`, `pptx`, `xlsx` 같은 문서의 PDF 변환
 - `imagemagick`: 이미지 형식 변환
 - `ghostscript`, `poppler-utils`, `fonts-nanum`: PDF/이미지/한글 폰트 보강
+- `pandoc`: Markdown, reStructuredText, Org, LaTeX, Typst, Notebook 같은 마크업 문서 변환
+- `calibre`: EPUB, MOBI, AZW3, FB2, CBZ 같은 전자책 변환
 - `g++`, `default-jdk`, `rustc`, `cargo`, `mono-devel`: C++, Java, Rust, C# 빌드 도구
 
-Python만 있어도 `csv -> json`, `json -> csv`, `txt/md/hwpx -> html`, `txt/md/hwpx -> pdf`, `파일 -> zip`은 동작합니다.
+Python만 있어도 `csv/tsv -> json`, `json/ndjson -> csv/tsv`, `srt <-> vtt`, `txt/md/hwpx -> html`, `txt/md/hwpx -> pdf`, `파일 -> zip`은 동작합니다.
 
 ## 보안 기본값
 

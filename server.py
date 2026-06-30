@@ -61,6 +61,9 @@ PORT = int(os.environ.get("PORT", "8000"))
 DOCUMENT_EXTS = {
     "doc",
     "docx",
+    "fodp",
+    "fods",
+    "fodt",
     "ppt",
     "pptx",
     "xls",
@@ -74,22 +77,100 @@ DOCUMENT_EXTS = {
     "hwp",
     "hwpx",
 }
-TEXT_EXTS = {"txt", "md", "csv", "json", "xml", "log", "srt", "vtt", "hwpx"}
-VIDEO_EXTS = {"mp4", "mov", "mkv", "avi", "webm", "m4v", "flv", "wmv"}
-AUDIO_EXTS = {"mp3", "wav", "aac", "m4a", "ogg", "flac", "opus", "wma"}
-IMAGE_EXTS = {"jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff", "heic", "avif"}
+DATA_EXTS = {"csv", "json", "ndjson", "tsv"}
+SUBTITLE_EXTS = {"srt", "vtt"}
+MARKUP_EXTS = {"md", "rst", "org", "tex", "latex", "typ", "ipynb"}
+TEXT_EXTS = {"txt", "xml", "log", "yaml", "yml", "hwpx"} | DATA_EXTS | SUBTITLE_EXTS | MARKUP_EXTS
+VIDEO_EXTS = {
+    "3g2",
+    "3gp",
+    "avi",
+    "flv",
+    "m2ts",
+    "m4v",
+    "mkv",
+    "mov",
+    "mp4",
+    "mpeg",
+    "mpg",
+    "mts",
+    "ogv",
+    "ts",
+    "webm",
+    "wmv",
+}
+AUDIO_EXTS = {
+    "aac",
+    "aif",
+    "aiff",
+    "amr",
+    "caf",
+    "flac",
+    "m4a",
+    "mid",
+    "midi",
+    "mp3",
+    "ogg",
+    "opus",
+    "wav",
+    "wma",
+}
+IMAGE_EXTS = {
+    "avif",
+    "bmp",
+    "gif",
+    "heic",
+    "ico",
+    "jpeg",
+    "jpg",
+    "pbm",
+    "pgm",
+    "png",
+    "pnm",
+    "ppm",
+    "psd",
+    "tga",
+    "tif",
+    "tiff",
+    "webp",
+}
+EBOOK_EXTS = {"azw3", "cbz", "chm", "djvu", "epub", "fb2", "mobi"}
 
-AUDIO_TARGETS = {"mp3", "wav", "aac", "m4a", "ogg", "flac", "opus"}
-VIDEO_TARGETS = {"mp4", "webm", "mov", "mkv", "gif"}
-IMAGE_TARGETS = {"jpg", "jpeg", "png", "webp", "gif", "bmp", "tiff", "pdf"}
+AUDIO_TARGETS = {"aac", "aiff", "flac", "m4a", "mp3", "ogg", "opus", "wav"}
+VIDEO_TARGETS = {"gif", "mkv", "mov", "mp4", "webm"}
+IMAGE_TARGETS = {"avif", "bmp", "gif", "ico", "jpg", "jpeg", "pdf", "png", "tiff", "webp"}
 PDF_IMAGE_TARGETS = {"jpg", "jpeg", "png"}
+DATA_TARGETS = {"csv", "json", "tsv"}
+SUBTITLE_TARGETS = {"srt", "vtt"}
+MARKUP_TARGETS = {"docx", "epub", "html", "pdf"}
+EBOOK_TARGETS = {"azw3", "epub", "mobi", "pdf", "txt"}
 PDF_EXTS = {"pdf"}
-ALLOWED_INPUT_EXTS = DOCUMENT_EXTS | TEXT_EXTS | VIDEO_EXTS | AUDIO_EXTS | IMAGE_EXTS | PDF_EXTS
-ALLOWED_TARGET_EXTS = AUDIO_TARGETS | VIDEO_TARGETS | IMAGE_TARGETS | PDF_IMAGE_TARGETS | {"csv", "json", "html", "pdf", "zip"}
+ALLOWED_INPUT_EXTS = DOCUMENT_EXTS | TEXT_EXTS | VIDEO_EXTS | AUDIO_EXTS | IMAGE_EXTS | EBOOK_EXTS | PDF_EXTS
+ALLOWED_TARGET_EXTS = (
+    AUDIO_TARGETS
+    | VIDEO_TARGETS
+    | IMAGE_TARGETS
+    | PDF_IMAGE_TARGETS
+    | DATA_TARGETS
+    | SUBTITLE_TARGETS
+    | MARKUP_TARGETS
+    | EBOOK_TARGETS
+    | {"zip"}
+)
 TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{32,96}$")
 EXT_RE = re.compile(r"^[a-z0-9]{1,12}$")
 CHUNK_SIZE = 1024 * 1024
-CONTAINER_TOOL_NAMES = {"ffmpeg", "libreoffice", "soffice", "magick", "convert", "pdftoppm"}
+CONTAINER_TOOL_NAMES = {
+    "ebook-convert",
+    "ffmpeg",
+    "libreoffice",
+    "soffice",
+    "magick",
+    "convert",
+    "pandoc",
+    "pdftoppm",
+    "pdftotext",
+}
 
 
 class ConversionError(Exception):
@@ -175,6 +256,9 @@ def installed_tools() -> dict:
         "ffmpeg": tool_path("ffmpeg"),
         "libreoffice": tool_path("libreoffice", "soffice"),
         "imagemagick": tool_path("magick", "convert"),
+        "poppler": tool_path("pdftoppm", "pdftotext"),
+        "pandoc": tool_path("pandoc"),
+        "calibre": tool_path("ebook-convert"),
         "g++": local_tool_path("g++"),
         "java": local_tool_path("javac"),
         "rust": local_tool_path("rustc"),
@@ -201,6 +285,10 @@ def operations() -> list[dict]:
     has_ffmpeg = bool(tools["ffmpeg"])
     has_office = bool(tools["libreoffice"])
     has_image = bool(tools["imagemagick"])
+    has_pdftoppm = bool(tool_path("pdftoppm"))
+    has_pdftotext = bool(tool_path("pdftotext"))
+    has_pandoc = bool(tools["pandoc"])
+    has_calibre = bool(tools["calibre"])
 
     ops = [
         {
@@ -241,27 +329,51 @@ def operations() -> list[dict]:
             "from": ["pdf"],
             "to": sorted(PDF_IMAGE_TARGETS),
             "engine": "poppler",
-            "available": bool(tool_path("pdftoppm")),
+            "available": has_pdftoppm,
+        },
+        {
+            "id": "pdf-text",
+            "label": "PDF -> 텍스트",
+            "from": ["pdf"],
+            "to": ["txt"],
+            "engine": "poppler",
+            "available": has_pdftotext,
         },
         {
             "id": "csv-json",
-            "label": "CSV -> JSON",
-            "from": ["csv"],
+            "label": "CSV/TSV -> JSON",
+            "from": ["csv", "tsv"],
             "to": ["json"],
             "engine": "python",
             "available": True,
         },
         {
             "id": "json-csv",
-            "label": "JSON -> CSV",
-            "from": ["json"],
-            "to": ["csv"],
+            "label": "JSON/NDJSON -> CSV/TSV",
+            "from": ["json", "ndjson"],
+            "to": ["csv", "tsv"],
+            "engine": "python",
+            "available": True,
+        },
+        {
+            "id": "ndjson-json",
+            "label": "NDJSON -> JSON",
+            "from": ["ndjson"],
+            "to": ["json"],
+            "engine": "python",
+            "available": True,
+        },
+        {
+            "id": "subtitle",
+            "label": "자막 변환",
+            "from": sorted(SUBTITLE_EXTS),
+            "to": sorted(SUBTITLE_TARGETS),
             "engine": "python",
             "available": True,
         },
         {
             "id": "text-html",
-            "label": "텍스트/Markdown/HWPX -> HTML",
+            "label": "텍스트/마크업/HWPX -> HTML",
             "from": sorted(TEXT_EXTS),
             "to": ["html"],
             "engine": "python",
@@ -269,11 +381,27 @@ def operations() -> list[dict]:
         },
         {
             "id": "text-pdf",
-            "label": "텍스트/HWPX -> PDF",
+            "label": "텍스트/마크업/HWPX -> PDF",
             "from": sorted(TEXT_EXTS),
             "to": ["pdf"],
             "engine": "python",
             "available": True,
+        },
+        {
+            "id": "markup-pandoc",
+            "label": "마크업 문서 변환",
+            "from": sorted(MARKUP_EXTS | {"html", "htm"}),
+            "to": sorted(MARKUP_TARGETS),
+            "engine": "pandoc",
+            "available": has_pandoc,
+        },
+        {
+            "id": "ebook",
+            "label": "전자책 변환",
+            "from": sorted(EBOOK_EXTS | {"html", "htm", "md", "pdf", "rtf", "txt"}),
+            "to": sorted(EBOOK_TARGETS),
+            "engine": "calibre",
+            "available": has_calibre,
         },
         {
             "id": "zip",
@@ -304,6 +432,10 @@ def capabilities() -> dict:
         "tools": public_tool_status(installed_tools()),
         "helpers": public_tool_status(built_helpers()),
         "operations": operations(),
+        "inputFormats": sorted(ALLOWED_INPUT_EXTS),
+        "targetFormats": sorted(ALLOWED_TARGET_EXTS),
+        "inputFormatCount": len(ALLOWED_INPUT_EXTS),
+        "targetFormatCount": len(ALLOWED_TARGET_EXTS),
         "maxUploadBytes": MAX_UPLOAD_BYTES,
         "maxConversionSeconds": MAX_CONVERSION_SECONDS,
         "resultTtlSeconds": RESULT_TTL_SECONDS,
@@ -465,6 +597,20 @@ def is_json_like(path: Path) -> bool:
         return False
 
 
+def is_ndjson_like(path: Path) -> bool:
+    if not is_text_like(path):
+        return False
+    lines = [line for line in read_text_file(path).splitlines() if line.strip()]
+    if not lines:
+        return False
+    try:
+        for line in lines[:1000]:
+            json.loads(line)
+        return True
+    except json.JSONDecodeError:
+        return False
+
+
 def is_xml_like(path: Path) -> bool:
     sample = path.read_bytes()[:8192]
     if not text_decodes(sample):
@@ -493,6 +639,27 @@ def is_mp4_like(sample: bytes, allowed_brands: set[str] | None = None) -> bool:
     return bool(brands & allowed_brands)
 
 
+def is_mpeg_video(sample: bytes) -> bool:
+    return sample.startswith((b"\x00\x00\x01\xba", b"\x00\x00\x01\xb3"))
+
+
+def is_transport_stream(path: Path) -> bool:
+    data = path.read_bytes()[:192 * 5]
+    if len(data) < 188 * 3:
+        return False
+    if all(data[index] == 0x47 for index in range(0, min(len(data), 188 * 5), 188)):
+        return True
+    return len(data) >= 192 * 3 and all(data[index] == 0x47 for index in range(4, min(len(data), 192 * 5), 192))
+
+
+def is_tga_like(path: Path) -> bool:
+    try:
+        trailer = path.read_bytes()[-26:]
+    except OSError:
+        return False
+    return trailer.endswith(b"TRUEVISION-XFILE.\x00")
+
+
 def detect_magic(path: Path, ext: str) -> str:
     sample = path.read_bytes()[:8192]
     lower_ext = ext.lower()
@@ -504,20 +671,42 @@ def detect_magic(path: Path, ext: str) -> str:
         "jpeg": sample.startswith(b"\xff\xd8\xff"),
         "gif": sample.startswith((b"GIF87a", b"GIF89a")),
         "bmp": sample.startswith(b"BM"),
+        "ico": sample.startswith((b"\x00\x00\x01\x00", b"\x00\x00\x02\x00")),
+        "psd": sample.startswith(b"8BPS"),
+        "pnm": sample[:2] in {b"P1", b"P2", b"P3", b"P4", b"P5", b"P6", b"P7"},
+        "pbm": sample[:2] in {b"P1", b"P4"},
+        "pgm": sample[:2] in {b"P2", b"P5"},
+        "ppm": sample[:2] in {b"P3", b"P6"},
+        "tga": is_tga_like(path),
         "tif": sample.startswith((b"II*\x00", b"MM\x00*")),
         "tiff": sample.startswith((b"II*\x00", b"MM\x00*")),
         "webp": sample.startswith(b"RIFF") and sample[8:12] == b"WEBP",
         "avi": sample.startswith(b"RIFF") and sample[8:12] == b"AVI ",
         "wav": sample.startswith(b"RIFF") and sample[8:12] == b"WAVE",
+        "aif": sample.startswith(b"FORM") and sample[8:12] in {b"AIFF", b"AIFC"},
+        "aiff": sample.startswith(b"FORM") and sample[8:12] in {b"AIFF", b"AIFC"},
+        "amr": sample.startswith((b"#!AMR\n", b"#!AMR-WB\n")),
+        "mid": sample.startswith(b"MThd"),
+        "midi": sample.startswith(b"MThd"),
+        "caf": sample.startswith(b"caff"),
         "flac": sample.startswith(b"fLaC"),
         "ogg": sample.startswith(b"OggS"),
+        "ogv": sample.startswith(b"OggS"),
+        "opus": sample.startswith(b"OggS"),
         "mp3": sample.startswith(b"ID3") or (len(sample) >= 2 and sample[0] == 0xFF and sample[1] & 0xE0 == 0xE0),
         "aac": len(sample) >= 2 and sample[0] == 0xFF and sample[1] & 0xF0 == 0xF0,
         "flv": sample.startswith(b"FLV"),
         "mkv": sample.startswith(b"\x1a\x45\xdf\xa3"),
         "webm": sample.startswith(b"\x1a\x45\xdf\xa3"),
+        "mpg": is_mpeg_video(sample),
+        "mpeg": is_mpeg_video(sample),
+        "ts": is_transport_stream(path),
+        "mts": is_transport_stream(path),
+        "m2ts": is_transport_stream(path),
         "wma": sample.startswith(b"\x30\x26\xb2\x75\x8e\x66\xcf\x11\xa6\xd9\x00\xaa\x00\x62\xce\x6c"),
         "wmv": sample.startswith(b"\x30\x26\xb2\x75\x8e\x66\xcf\x11\xa6\xd9\x00\xaa\x00\x62\xce\x6c"),
+        "djvu": sample.startswith(b"AT&TFORM") and b"DJV" in sample[:32],
+        "chm": sample.startswith(b"ITSF"),
         "hwp": ole,
         "doc": ole,
         "xls": ole,
@@ -527,13 +716,15 @@ def detect_magic(path: Path, ext: str) -> str:
         "mov": is_mp4_like(sample),
         "m4v": is_mp4_like(sample),
         "m4a": is_mp4_like(sample),
+        "3gp": is_mp4_like(sample, {"3gp4", "3gp5", "3gp6", "3gp7", "3ge6", "3ge7"}),
+        "3g2": is_mp4_like(sample, {"3g2a", "3g2b", "3g2c"}),
         "heic": is_mp4_like(sample, {"heic", "heix", "hevc", "hevx", "mif1", "msf1"}),
         "avif": is_mp4_like(sample, {"avif", "avis"}),
     }
     if lower_ext in signatures and signatures[lower_ext]:
         return lower_ext
 
-    if lower_ext in {"docx", "pptx", "xlsx", "odt", "ods", "odp", "hwpx"} and sample.startswith(b"PK\x03\x04"):
+    if lower_ext in {"docx", "pptx", "xlsx", "odt", "ods", "odp", "hwpx", "epub", "cbz"} and sample.startswith(b"PK\x03\x04"):
         names = archive_names(path)
         if lower_ext == "docx" and zip_has_prefix(names, "word/"):
             return "docx"
@@ -543,15 +734,45 @@ def detect_magic(path: Path, ext: str) -> str:
             return "xlsx"
         if lower_ext == "hwpx" and (zip_has_prefix(names, "contents/") or zip_has_name(names, "mimetype")):
             return "hwpx"
+        if lower_ext == "epub" and zip_has_name(names, "mimetype"):
+            return "epub"
+        if lower_ext == "cbz":
+            return "cbz"
         if lower_ext in {"odt", "ods", "odp"} and zip_has_name(names, "mimetype"):
             return lower_ext
 
-    if lower_ext in {"txt", "md", "csv", "log", "srt", "vtt", "html", "htm"} and is_text_like(path):
-        return "text"
-    if lower_ext == "json" and is_json_like(path):
+    if lower_ext in {"azw3", "mobi"} and b"BOOKMOBI" in sample[:256]:
+        return lower_ext
+    if lower_ext == "fb2" and is_xml_like(path):
+        return "fb2"
+    if lower_ext in {"fodt", "fods", "fodp"} and is_xml_like(path):
+        return lower_ext
+    if lower_ext == "ndjson" and is_ndjson_like(path):
+        return "ndjson"
+    if lower_ext in {"json"} and is_json_like(path):
         return "json"
-    if lower_ext == "xml" and is_xml_like(path):
+    if lower_ext in {"xml"} and is_xml_like(path):
         return "xml"
+    if lower_ext in {
+        "csv",
+        "html",
+        "htm",
+        "ipynb",
+        "latex",
+        "log",
+        "md",
+        "org",
+        "rst",
+        "srt",
+        "tex",
+        "tsv",
+        "txt",
+        "typ",
+        "vtt",
+        "yaml",
+        "yml",
+    } and is_text_like(path):
+        return "text"
     return "unknown"
 
 
@@ -617,15 +838,44 @@ def load_download_metadata(job_id: str) -> dict | None:
     return metadata
 
 
-def convert_csv_to_json(input_path: Path, output_path: Path) -> None:
+def convert_delimited_to_json(input_path: Path, output_path: Path, delimiter: str | None = None) -> None:
     text = read_text_file(input_path)
     sample = text[:4096]
-    try:
-        dialect = csv.Sniffer().sniff(sample)
-    except csv.Error:
-        dialect = csv.excel
-    rows = list(csv.DictReader(text.splitlines(), dialect=dialect))
+    if delimiter is None:
+        try:
+            dialect = csv.Sniffer().sniff(sample)
+        except csv.Error:
+            dialect = csv.excel
+        rows = list(csv.DictReader(text.splitlines(), dialect=dialect))
+    else:
+        rows = list(csv.DictReader(text.splitlines(), delimiter=delimiter))
     write_json(output_path, rows)
+
+
+def convert_csv_to_json(input_path: Path, output_path: Path) -> None:
+    convert_delimited_to_json(input_path, output_path)
+
+
+def convert_tsv_to_json(input_path: Path, output_path: Path) -> None:
+    convert_delimited_to_json(input_path, output_path, "\t")
+
+
+def read_ndjson(input_path: Path) -> list:
+    records = []
+    for line_no, line in enumerate(read_text_file(input_path).splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError as exc:
+            raise ConversionError(f"NDJSON {line_no}번째 줄을 파싱하지 못했습니다: {exc.msg}") from exc
+    if not records:
+        raise ConversionError("NDJSON에 변환할 레코드가 없습니다.")
+    return records
+
+
+def convert_ndjson_to_json(input_path: Path, output_path: Path) -> None:
+    write_json(output_path, read_ndjson(input_path))
 
 
 def normalize_json_records(data):
@@ -652,13 +902,76 @@ def normalize_json_records(data):
     return normalized, fieldnames
 
 
-def convert_json_to_csv(input_path: Path, output_path: Path) -> None:
+def convert_json_to_delimited(input_path: Path, output_path: Path, delimiter: str = ",") -> None:
     data = json.loads(read_text_file(input_path))
     rows, fieldnames = normalize_json_records(data)
     with output_path.open("w", encoding="utf-8-sig", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, delimiter=delimiter)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def convert_json_to_csv(input_path: Path, output_path: Path) -> None:
+    convert_json_to_delimited(input_path, output_path)
+
+
+def convert_json_to_tsv(input_path: Path, output_path: Path) -> None:
+    convert_json_to_delimited(input_path, output_path, "\t")
+
+
+def convert_ndjson_to_delimited(input_path: Path, output_path: Path, delimiter: str = ",") -> None:
+    rows, fieldnames = normalize_json_records(read_ndjson(input_path))
+    with output_path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, delimiter=delimiter)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def convert_ndjson_to_csv(input_path: Path, output_path: Path) -> None:
+    convert_ndjson_to_delimited(input_path, output_path)
+
+
+def convert_ndjson_to_tsv(input_path: Path, output_path: Path) -> None:
+    convert_ndjson_to_delimited(input_path, output_path, "\t")
+
+
+def convert_srt_to_vtt(input_path: Path, output_path: Path) -> None:
+    text = read_text_file(input_path).replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"(\d{2}:\d{2}:\d{2}),(\d{3})", r"\1.\2", text)
+    output_path.write_text("WEBVTT\n\n" + text.strip() + "\n", encoding="utf-8")
+
+
+def convert_vtt_to_srt(input_path: Path, output_path: Path) -> None:
+    text = read_text_file(input_path).replace("\r\n", "\n").replace("\r", "\n")
+    lines = text.splitlines()
+    if lines and lines[0].lstrip("\ufeff").strip().upper().startswith("WEBVTT"):
+        lines = lines[1:]
+    blocks = []
+    current = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if current:
+                blocks.append(current)
+                current = []
+            continue
+        if stripped.startswith(("NOTE", "STYLE", "REGION")):
+            continue
+        current.append(line)
+    if current:
+        blocks.append(current)
+
+    output_blocks = []
+    cue_index = 1
+    for block in blocks:
+        if not any("-->" in line for line in block):
+            continue
+        converted = [re.sub(r"(\d{2}:\d{2}:\d{2})\.(\d{3})", r"\1,\2", line) for line in block]
+        if not converted[0].strip().isdigit():
+            converted.insert(0, str(cue_index))
+        output_blocks.append("\n".join(converted))
+        cue_index += 1
+    output_path.write_text("\n\n".join(output_blocks).strip() + "\n", encoding="utf-8")
 
 
 def local_name(tag: str) -> str:
@@ -1450,6 +1763,19 @@ def convert_pdf_to_image(input_path: Path, output_path: Path, target: str) -> No
         generated.replace(output_path)
 
 
+def convert_pdf_to_text(input_path: Path, output_path: Path) -> None:
+    pdftotext = tool_path("pdftotext")
+    if not pdftotext:
+        raise ConversionError("poppler-utils가 설치되어 있지 않습니다. scripts/install-ubuntu-deps.sh를 실행하세요.")
+    command = [pdftotext, "-enc", "UTF-8", "-layout", str(input_path), str(output_path)]
+    run_checked(
+        command,
+        cwd=output_path.parent,
+        docker_mounts=[(input_path.parent, "/input", "ro"), (output_path.parent, "/work", "rw")],
+        path_map={input_path: f"/input/{input_path.name}", output_path: f"/work/{output_path.name}"},
+    )
+
+
 def convert_with_libreoffice(input_path: Path, output_path: Path, target: str) -> None:
     office = tool_path("libreoffice", "soffice")
     if not office:
@@ -1493,6 +1819,57 @@ def convert_with_libreoffice(input_path: Path, output_path: Path, target: str) -
         remove_tree(profile_dir)
 
 
+def convert_with_pandoc(input_path: Path, output_path: Path, target: str) -> None:
+    pandoc = tool_path("pandoc")
+    if not pandoc:
+        raise ConversionError("pandoc이 설치되어 있지 않습니다. scripts/install-ubuntu-deps.sh를 실행하세요.")
+
+    command = [
+        pandoc,
+        str(input_path),
+        "--standalone",
+        "--metadata",
+        f"title={input_path.stem}",
+        "-o",
+        str(output_path),
+    ]
+    if target == "html":
+        command.insert(2, "--embed-resources")
+    run_checked(
+        command,
+        timeout=max(MAX_CONVERSION_SECONDS, 90),
+        cwd=output_path.parent,
+        docker_mounts=[(input_path.parent, "/input", "ro"), (output_path.parent, "/work", "rw")],
+        path_map={input_path: f"/input/{input_path.name}", output_path: f"/work/{output_path.name}"},
+    )
+
+
+def convert_with_calibre(input_path: Path, output_path: Path) -> None:
+    calibre = tool_path("ebook-convert")
+    if not calibre:
+        raise ConversionError("Calibre ebook-convert가 설치되어 있지 않습니다. scripts/install-ubuntu-deps.sh를 실행하세요.")
+
+    profile_dir = output_path.parent / ".calibre-profile"
+    mkdir_private(profile_dir)
+    command = [
+        calibre,
+        str(input_path),
+        str(output_path),
+        "--disable-font-rescaling",
+    ]
+    try:
+        run_checked(
+            command,
+            timeout=max(MAX_CONVERSION_SECONDS, 120),
+            cwd=output_path.parent,
+            extra_env={"HOME": str(profile_dir), "CALIBRE_CONFIG_DIRECTORY": str(profile_dir)},
+            docker_mounts=[(input_path.parent, "/input", "ro"), (output_path.parent, "/work", "rw")],
+            path_map={input_path: f"/input/{input_path.name}", output_path: f"/work/{output_path.name}", profile_dir: "/work/.calibre-profile"},
+        )
+    finally:
+        remove_tree(profile_dir)
+
+
 def convert_file(input_path: Path, original_name: str, target: str, job_output_dir: Path) -> Path:
     source_ext = input_path.suffix.lower().lstrip(".")
     target = target.lower().lstrip(".")
@@ -1511,8 +1888,28 @@ def convert_file(input_path: Path, original_name: str, target: str, job_output_d
         zip_single_file(input_path, output_path, original_name)
     elif source_ext == "csv" and target == "json":
         convert_csv_to_json(input_path, output_path)
+    elif source_ext == "tsv" and target == "json":
+        convert_tsv_to_json(input_path, output_path)
+    elif source_ext == "ndjson" and target == "json":
+        convert_ndjson_to_json(input_path, output_path)
     elif source_ext == "json" and target == "csv":
         convert_json_to_csv(input_path, output_path)
+    elif source_ext == "json" and target == "tsv":
+        convert_json_to_tsv(input_path, output_path)
+    elif source_ext == "ndjson" and target == "csv":
+        convert_ndjson_to_csv(input_path, output_path)
+    elif source_ext == "ndjson" and target == "tsv":
+        convert_ndjson_to_tsv(input_path, output_path)
+    elif source_ext == "srt" and target == "vtt":
+        convert_srt_to_vtt(input_path, output_path)
+    elif source_ext == "vtt" and target == "srt":
+        convert_vtt_to_srt(input_path, output_path)
+    elif source_ext in (MARKUP_EXTS | {"html", "htm"}) and target in MARKUP_TARGETS and target not in {"html", "pdf"}:
+        convert_with_pandoc(input_path, output_path, target)
+    elif source_ext in EBOOK_EXTS and target in EBOOK_TARGETS:
+        convert_with_calibre(input_path, output_path)
+    elif source_ext in {"html", "htm", "md", "pdf", "rtf", "txt"} and target in {"azw3", "epub", "mobi"}:
+        convert_with_calibre(input_path, output_path)
     elif target == "html" and source_ext in TEXT_EXTS:
         convert_text_to_html(input_path, output_path, original_name)
     elif target == "pdf" and source_ext in TEXT_EXTS:
@@ -1521,6 +1918,8 @@ def convert_file(input_path: Path, original_name: str, target: str, job_output_d
         convert_with_ffmpeg(input_path, output_path, target)
     elif source_ext == "pdf" and target in PDF_IMAGE_TARGETS:
         convert_pdf_to_image(input_path, output_path, target)
+    elif source_ext == "pdf" and target == "txt":
+        convert_pdf_to_text(input_path, output_path)
     elif source_ext in IMAGE_EXTS:
         convert_with_imagemagick(input_path, output_path)
     elif target == "pdf" and source_ext in DOCUMENT_EXTS:
@@ -1708,6 +2107,10 @@ class FileTransHandler(BaseHTTPRequestHandler):
             return
         input_path = job_upload_dir / f"input.{source_ext}"
 
+        error_message = None
+        error_status = HTTPStatus.BAD_REQUEST
+        output_path = None
+        metadata = None
         try:
             size, digest = copy_stream_limited(file_item.file, input_path, MAX_UPLOAD_BYTES)
             source = validate_upload_file(input_path, original_name, size, digest)
@@ -1719,15 +2122,21 @@ class FileTransHandler(BaseHTTPRequestHandler):
             metadata = create_download_metadata(job_id, output_path, original_name, source)
         except ConversionError as exc:
             remove_tree(job_output_dir)
-            self.send_error_json(str(exc))
-            return
+            error_message = str(exc)
         except Exception as exc:
             remove_tree(job_output_dir)
-            self.send_error_json(f"변환 중 오류가 발생했습니다: {exc}", HTTPStatus.INTERNAL_SERVER_ERROR)
-            return
+            error_message = f"변환 중 오류가 발생했습니다: {exc}"
+            error_status = HTTPStatus.INTERNAL_SERVER_ERROR
         finally:
             safe_unlink(input_path)
             remove_tree(job_upload_dir)
+
+        if error_message:
+            self.send_error_json(error_message, error_status)
+            return
+        if output_path is None or metadata is None:
+            self.send_error_json("변환 결과를 확인하지 못했습니다.", HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
 
         self.send_json(
             {

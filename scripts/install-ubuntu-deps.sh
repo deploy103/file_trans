@@ -9,6 +9,8 @@ sudo apt-get install -y \
   imagemagick \
   ghostscript \
   poppler-utils \
+  pandoc \
+  calibre \
   fonts-nanum \
   g++ \
   default-jdk \

@@ -12,6 +12,7 @@ const convertButton = document.querySelector("#convertButton");
 const convertForm = document.querySelector("#convertForm");
 const toolStatus = document.querySelector("#toolStatus");
 const operationGrid = document.querySelector("#operationGrid");
+const operationTitle = document.querySelector("#operationTitle");
 const resultPanel = document.querySelector("#resultPanel");
 const resultTitle = document.querySelector("#resultTitle");
 const resultMeta = document.querySelector("#resultMeta");
@@ -47,6 +48,7 @@ function targetsFor(ext) {
   if (!state.capabilities) return [];
   const targets = new Set();
   for (const op of state.capabilities.operations) {
+    if (!op.available) continue;
     if (op.from.includes("*") || op.from.includes(ext)) {
       for (const target of op.to) {
         if (target !== ext) targets.add(target);
@@ -61,6 +63,9 @@ function toolLabel(name) {
     ffmpeg: "ffmpeg",
     libreoffice: "LibreOffice",
     imagemagick: "ImageMagick",
+    poppler: "Poppler",
+    pandoc: "Pandoc",
+    calibre: "Calibre",
     "g++": "C++",
     java: "Java",
     rust: "Rust",
@@ -89,6 +94,9 @@ function renderTools() {
 function renderOperations() {
   operationGrid.replaceChildren();
   const operations = state.capabilities?.operations || [];
+  const inputCount = state.capabilities?.inputFormatCount || 0;
+  const targetCount = state.capabilities?.targetFormatCount || 0;
+  operationTitle.textContent = inputCount && targetCount ? `지원 변환 · 입력 ${inputCount}개 · 출력 ${targetCount}개` : "지원 변환";
   for (const op of operations) {
     const item = document.createElement("article");
     item.className = `operation ${op.available ? "" : "unavailable"}`;
