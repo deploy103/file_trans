@@ -1,5 +1,6 @@
 import hashlib
 import os
+import stat
 import tempfile
 import unittest
 import zipfile
@@ -33,6 +34,18 @@ class SecurityValidationTests(unittest.TestCase):
             path = Path(tmp) / "bad.docx"
             with zipfile.ZipFile(path, "w") as archive:
                 archive.writestr("../evil.txt", "owned")
+            with self.assertRaises(server.ConversionError):
+                server.archive_names(path)
+
+    def test_zip_symlink_member_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "symlink.docx"
+            link = zipfile.ZipInfo("word/link")
+            link.external_attr = (stat.S_IFLNK | 0o777) << 16
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr("[Content_Types].xml", "<Types/>")
+                archive.writestr("word/document.xml", "<document/>")
+                archive.writestr(link, "document.xml")
             with self.assertRaises(server.ConversionError):
                 server.archive_names(path)
 
@@ -105,12 +118,40 @@ class SecurityValidationTests(unittest.TestCase):
             with self.assertRaises(server.ConversionError):
                 server.validate_upload_file(path, "remote.md", len(data), hashlib.sha256(data).hexdigest())
 
+    def test_late_markdown_external_reference_is_rejected(self):
+        text = ("a" * (1024 * 1024 + 16)) + "\n[x]: http://169.254.169.254/latest/meta-data/\n"
+        self.assertTrue(server.text_has_external_reference(text))
+
+    def test_flat_open_document_external_reference_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "remote.fodt"
+            text = (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<office:document><draw:image xlink:href="http://169.254.169.254/latest/meta-data/"/>'
+                "</office:document>"
+            )
+            data = text.encode("utf-8")
+            path.write_bytes(data)
+            with self.assertRaises(server.ConversionError):
+                server.validate_upload_file(path, "remote.fodt", len(data), hashlib.sha256(data).hexdigest())
+
+    def test_xml_dtd_or_entity_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "entity.fodt"
+            text = '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><foo/>'
+            data = text.encode("utf-8")
+            path.write_bytes(data)
+            with self.assertRaisesRegex(server.ConversionError, "DTD 또는 ENTITY"):
+                server.validate_upload_file(path, "entity.fodt", len(data), hashlib.sha256(data).hexdigest())
+
     def test_markup_external_reference_patterns(self):
         samples = [
             ".. image:: http://169.254.169.254/latest/meta-data/\n",
             "[[file:///etc/passwd]]\n",
             "\\href{https://example.test/file}{x}",
             'image("https://example.test/file")',
+            "<https://example.test/file>",
+            "[ref]: https://example.test/file",
         ]
         for sample in samples:
             with self.subTest(sample=sample):
@@ -172,6 +213,27 @@ class SecurityValidationTests(unittest.TestCase):
         self.assertTrue(server.FileTransServer.daemon_threads)
         self.assertTrue(server.FileTransServer.allow_reuse_address)
 
+    def test_same_origin_post_is_allowed(self):
+        self.assertTrue(server.request_origin_allowed("http://127.0.0.1:8000", "127.0.0.1:8000"))
+        self.assertTrue(server.request_origin_allowed(None, "127.0.0.1:8000"))
+
+    def test_configured_frontend_origin_is_allowed(self):
+        previous = server.ALLOWED_ORIGINS
+        server.ALLOWED_ORIGINS = {"http://127.0.0.1:4762"}
+        try:
+            self.assertTrue(server.request_origin_allowed("http://127.0.0.1:4762", "127.0.0.1:8766"))
+            self.assertEqual(
+                server.parse_allowed_origins("http://127.0.0.1:4762/, https://example.test/path"),
+                {"http://127.0.0.1:4762", "https://example.test"},
+            )
+        finally:
+            server.ALLOWED_ORIGINS = previous
+
+    def test_cross_origin_post_is_rejected(self):
+        self.assertFalse(server.request_origin_allowed("https://example.test", "127.0.0.1:8000"))
+        self.assertFalse(server.request_origin_allowed("null", "127.0.0.1:8000"))
+        self.assertFalse(server.request_origin_allowed(None, "127.0.0.1:8000", "cross-site"))
+
     def test_clamscan_infected_result_is_rejected(self):
         with self.assertRaises(server.ConversionError):
             server.raise_for_clamscan_result(1, "Eicar-Test-Signature FOUND")
@@ -187,6 +249,21 @@ class SecurityValidationTests(unittest.TestCase):
             server.scan_upload_for_malware(Path("does-not-need-to-exist"))
         finally:
             server.ENABLE_CLAMSCAN = previous
+
+    def test_conversion_environment_uses_safe_path(self):
+        previous = server.CONVERSION_PATH
+        server.CONVERSION_PATH = "/usr/bin:/bin"
+        try:
+            env = server.conversion_env()
+            self.assertEqual(env["PATH"], "/usr/bin:/bin")
+            self.assertNotIn(os.getcwd(), env["PATH"].split(os.pathsep))
+            self.assertNotIn(".", env["PATH"].split(os.pathsep))
+        finally:
+            server.CONVERSION_PATH = previous
+
+    def test_conversion_path_ignores_relative_entries(self):
+        value = os.pathsep.join([".", "relative/bin", "/usr/bin", "/bin", "/usr/bin", ""])
+        self.assertEqual(server.normalize_conversion_path(value), "/usr/bin:/bin")
 
     def test_download_tokens_are_redacted_from_logs(self):
         text = (

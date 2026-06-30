@@ -4,57 +4,95 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>File Trans</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
-  <main class="app-shell">
-    <section class="workspace">
-      <header class="topbar">
-        <div>
-          <p class="eyebrow">File Trans</p>
-          <h1>파일 변환</h1>
+  <nav class="top-nav">
+    <div class="nav-inner">
+      <a class="brand-link" href="/">
+        <span class="brand-icon icon-swap" aria-hidden="true"></span>
+        <span>File Trans</span>
+      </a>
+      <div class="nav-links">
+        <a href="/" data-nav-home>홈</a>
+        <a href="/" data-nav-tools>도구 모음</a>
+      </div>
+    </div>
+  </nav>
+
+  <main class="page-shell">
+    <section id="toolPage" class="tool-page">
+      <header class="tool-hero">
+        <h1>모든 변환 도구</h1>
+        <p>원하는 변환 작업을 선택하면 최적화된 설정으로 바로 시작할 수 있습니다.</p>
+      </header>
+      <div id="toolGrid" class="tool-grid"></div>
+    </section>
+
+    <section id="converterPage" class="converter-page" hidden>
+      <a class="back-link" href="/">도구 모음으로 돌아가기</a>
+
+      <header class="converter-hero">
+        <div class="converter-title-row">
+          <h1>File Trans</h1>
+          <span id="routeBadge" class="route-badge">파일 → 파일</span>
         </div>
-        <div class="tool-status" id="toolStatus" aria-label="변환 엔진 상태"></div>
+        <p id="routeSubtitle">파일을 업로드하면 선택한 형식으로 바로 변환합니다.</p>
       </header>
 
-      <form id="convertForm" class="converter" enctype="multipart/form-data">
-        <label class="dropzone" id="dropzone">
-          <input id="fileInput" name="file" type="file">
-          <span class="drop-icon" aria-hidden="true"></span>
-          <span class="drop-title" id="fileTitle">파일 선택</span>
-          <span class="drop-meta" id="fileMeta">최대 100MB</span>
-        </label>
+      <section id="uploadSection" class="upload-section">
+        <div id="dropzone" class="dropzone" role="button" tabindex="0">
+          <input id="fileInput" name="file" type="file" multiple aria-hidden="true" tabindex="-1">
+          <span class="upload-icon icon-upload" aria-hidden="true"></span>
+          <span id="dropTitle" class="drop-title">파일을 이곳으로 드래그하거나 클릭하여 추가하세요</span>
+          <span class="drop-meta" id="dropMeta">여러 파일을 한 번에 선택하고 변환할 수 있습니다.</span>
+          <span class="browse-pill">파일 찾아보기</span>
+        </div>
+      </section>
 
-        <div class="controls">
-          <label class="field">
-            <span>출력 형식</span>
-            <select id="targetSelect" name="target" disabled>
-              <option value="">파일을 먼저 선택하세요</option>
-            </select>
-          </label>
-          <button class="primary" id="convertButton" type="submit" disabled>
-            변환
-          </button>
+      <form id="convertForm" class="control-section" enctype="multipart/form-data" hidden>
+        <section class="workspace-panel">
+          <div class="workspace-copy">
+            <h2>선택된 파일 <span id="fileCountBadge">0</span></h2>
+            <p id="workspaceStatusText">변환할 파일을 추가하고 시작 버튼을 눌러주세요.</p>
+          </div>
+          <div id="actionReady" class="workspace-actions">
+            <button id="addMoreButton" class="text-button" type="button">추가</button>
+            <span class="action-divider" aria-hidden="true"></span>
+            <button id="convertButton" class="primary" type="submit" disabled>
+              <span class="button-icon icon-play" aria-hidden="true"></span>
+              변환 시작
+            </button>
+          </div>
+          <div id="actionDone" class="workspace-actions" hidden>
+            <button id="resetButton" class="secondary" type="button">새로 시작</button>
+            <button id="downloadZipButton" class="secondary" type="button">
+              ZIP 다운로드
+            </button>
+            <button id="downloadAllButton" class="primary" type="button">
+              <span class="button-icon icon-download" aria-hidden="true"></span>
+              전체 다운로드
+            </button>
+          </div>
+        </section>
+
+        <div id="fileList" class="file-list"></div>
+
+        <div id="subDropzone" class="sub-dropzone" role="button" tabindex="0">
+          <span aria-hidden="true">+</span>
+          <span>이곳에 파일을 드래그하여 추가</span>
         </div>
       </form>
-
-      <section class="result-panel" id="resultPanel" hidden>
-        <div>
-          <p class="result-title" id="resultTitle"></p>
-          <p class="result-meta" id="resultMeta"></p>
-        </div>
-        <a class="download" id="downloadLink" href="#" download>다운로드</a>
-      </section>
-
-      <section class="operation-panel">
-        <div class="panel-heading">
-          <h2 id="operationTitle">지원 변환</h2>
-          <button class="ghost" id="refreshButton" type="button">새로고침</button>
-        </div>
-        <div class="operation-grid" id="operationGrid"></div>
-      </section>
     </section>
   </main>
+
+  <footer class="site-footer">
+    <div class="footer-inner">
+      <p>ffmpeg, LibreOffice, ImageMagick, Poppler 등의 로컬 엔진을 활용하여 오프라인 환경에서 안전하게 변환합니다.</p>
+      <div id="toolStatus" class="tool-status" aria-label="변환 엔진 상태"></div>
+    </div>
+  </footer>
 
   <script src="/app.js" defer></script>
 </body>

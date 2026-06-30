@@ -19,6 +19,7 @@ fi
 BASE_URL="http://${HOST}:${PORT}"
 LOG_FILE="$(mktemp /tmp/file-trans-smoke.XXXXXX.log)"
 TMP_DIR="$(mktemp -d /tmp/file-trans-smoke.XXXXXX)"
+SMOKE_DATA_DIR="${TMP_DIR}/data"
 SERVER_PID=""
 
 cleanup() {
@@ -31,7 +32,7 @@ cleanup() {
 trap cleanup EXIT
 
 cd "${ROOT_DIR}"
-HOST="${HOST}" PORT="${PORT}" python3 server.py >"${LOG_FILE}" 2>&1 &
+FILE_TRANS_DATA_DIR="${SMOKE_DATA_DIR}" HOST="${HOST}" PORT="${PORT}" python3 server.py >"${LOG_FILE}" 2>&1 &
 SERVER_PID="$!"
 
 for _ in $(seq 1 50); do
@@ -60,6 +61,13 @@ assert data["maxReferenceScanBytes"] > 0
 
 curl -fsS -D "${TMP_DIR}/headers.txt" "${BASE_URL}/" -o "${TMP_DIR}/index.html"
 grep -qi '^Server: FileTrans/' "${TMP_DIR}/headers.txt"
+grep -qi '^X-Content-Type-Options: nosniff' "${TMP_DIR}/headers.txt"
+grep -qi '^X-Frame-Options: DENY' "${TMP_DIR}/headers.txt"
+grep -qi '^Referrer-Policy: no-referrer' "${TMP_DIR}/headers.txt"
+grep -qi '^Permissions-Policy:' "${TMP_DIR}/headers.txt"
+grep -qi '^Cross-Origin-Resource-Policy: same-origin' "${TMP_DIR}/headers.txt"
+grep -qi '^X-Permitted-Cross-Domain-Policies: none' "${TMP_DIR}/headers.txt"
+grep -qi '^Content-Security-Policy:' "${TMP_DIR}/headers.txt"
 if grep -qi '^Server: .*Python' "${TMP_DIR}/headers.txt"; then
   echo "Server header leaks Python version" >&2
   exit 1
@@ -70,6 +78,39 @@ PUT_STATUS="$(curl -sS -o "${TMP_DIR}/put.txt" -w '%{http_code}' -X PUT "${BASE_
 [[ "${PUT_STATUS}" == "405" ]]
 HEAD_STATUS="$(curl -fsS -o /dev/null -w '%{http_code}' -I "${BASE_URL}/api/capabilities")"
 [[ "${HEAD_STATUS}" == "200" ]]
+TRAVERSAL_STATUS="$(curl -sS -o "${TMP_DIR}/traversal.txt" -w '%{http_code}' "${BASE_URL}/%2e%2e/server.py")"
+[[ "${TRAVERSAL_STATUS}" == "403" ]]
+
+PREFLIGHT_STATUS="$(
+  curl -sS -D "${TMP_DIR}/preflight-headers.txt" -o "${TMP_DIR}/preflight.txt" -w '%{http_code}' \
+    -X OPTIONS \
+    -H "Origin: ${BASE_URL}" \
+    -H 'Access-Control-Request-Method: POST' \
+    -H 'Access-Control-Request-Headers: Content-Type' \
+    "${BASE_URL}/convert"
+)"
+[[ "${PREFLIGHT_STATUS}" == "204" ]]
+grep -qi "^Access-Control-Allow-Origin: ${BASE_URL}" "${TMP_DIR}/preflight-headers.txt"
+BAD_PREFLIGHT_STATUS="$(
+  curl -sS -o "${TMP_DIR}/bad-preflight.txt" -w '%{http_code}' \
+    -X OPTIONS \
+    -H 'Origin: https://example.test' \
+    -H 'Access-Control-Request-Method: POST' \
+    "${BASE_URL}/convert"
+)"
+[[ "${BAD_PREFLIGHT_STATUS}" == "403" ]]
+
+CSRF_FILE="${TMP_DIR}/csrf.txt"
+printf 'cross-site request\n' >"${CSRF_FILE}"
+CSRF_STATUS="$(
+  curl -sS -o "${TMP_DIR}/csrf-response.json" -w '%{http_code}' \
+    -H 'Origin: https://example.test' \
+    -F "file=@${CSRF_FILE};filename=csrf.txt" \
+    -F "target=html" \
+    "${BASE_URL}/convert"
+)"
+[[ "${CSRF_STATUS}" == "403" ]]
+grep -q '허용되지 않은 요청 출처입니다' "${TMP_DIR}/csrf-response.json"
 
 CSV_FILE="${TMP_DIR}/scores.csv"
 printf 'name,score\nkim,10\nlee,20\n' >"${CSV_FILE}"
@@ -160,8 +201,8 @@ EXE_STATUS="$(
 [[ "${EXE_STATUS}" == "400" ]]
 grep -q '.exe 파일은 업로드 허용 목록에 없습니다' "${TMP_DIR}/exe-response.json"
 
-if find data/uploads -mindepth 1 -maxdepth 2 -print -quit | grep -q .; then
-  echo "data/uploads is not empty" >&2
+if find "${SMOKE_DATA_DIR}/uploads" -mindepth 1 -maxdepth 2 -print -quit | grep -q .; then
+  echo "smoke upload staging directory is not empty" >&2
   exit 1
 fi
 

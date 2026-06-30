@@ -7,6 +7,10 @@ __pycache__/
 DEVLOG.md
 개발일지.md
 요구사항
+변환도구모음.html
+변환하는페이지예시.html
+파일추가화면.html
+파비콘.xml
 
 # Deployment and server-local secrets
 deploy/
@@ -23,5 +27,7 @@ private/
 
 # Runtime logs and temporary files
 *.log
+*.swp
 tmp/
 temp/
+public/.frontend-smoke-*

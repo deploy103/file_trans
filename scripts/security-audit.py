@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -9,8 +11,8 @@ sys.path.insert(0, str(ROOT))
 
 import server  # noqa: E402
 
-FORBIDDEN_TRACKED_PREFIXES = ("data/", "build/", "deploy/", "secrets/", "private/")
-FORBIDDEN_TRACKED_NAMES = {"개발일지.md", "요구사항", ".env", ".env.local"}
+FORBIDDEN_TRACKED_PREFIXES = ("data/", "build/", "deploy/", "secrets/", "private/", "tools/")
+FORBIDDEN_TRACKED_NAMES = {"개발일지.md", "요구사항", ".env", ".env.local", "scripts/build-toolchain.sh"}
 
 
 def fail(message: str) -> None:
@@ -32,6 +34,8 @@ def tracked_files() -> list[str]:
 
 def check_tracked_files() -> None:
     for filename in tracked_files():
+        if not (ROOT / filename).exists():
+            continue
         if filename in FORBIDDEN_TRACKED_NAMES:
             fail(f"forbidden tracked file: {filename}")
         if filename.startswith(FORBIDDEN_TRACKED_PREFIXES):
@@ -44,6 +48,22 @@ def check_command_execution() -> None:
     for needle in forbidden:
         if needle in source:
             fail(f"forbidden command execution pattern found: {needle}")
+
+    makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+    if "build-tools:" in makefile:
+        fail("Makefile must not expose a code build-tools target")
+
+
+def check_conversion_path() -> None:
+    path_entries = server.conversion_env()["PATH"].split(os.pathsep)
+    if not path_entries:
+        fail("conversion PATH must not be empty")
+    for entry in path_entries:
+        path = Path(entry)
+        if not path.is_absolute():
+            fail(f"conversion PATH entry must be absolute: {entry}")
+        if entry == ".":
+            fail("conversion PATH must not include current directory")
 
 
 def check_imagemagick_policy() -> None:
@@ -114,13 +134,49 @@ def check_capabilities() -> None:
         fail("build helpers must not be exposed in capabilities")
 
 
+def check_frontend() -> None:
+    for relative in ("public/index.html", "public/app.js", "public/styles.css"):
+        text = (ROOT / relative).read_text(encoding="utf-8")
+        for url in re.findall(r"https?://[^\"')\s<>]+", text):
+            if not (url.startswith("http://127.0.0.1") or url.startswith("http://localhost")):
+                fail(f"frontend asset must not depend on external URL: {relative}: {url}")
+        for needle in ("innerHTML", "document.write", "eval("):
+            if needle in text:
+                fail(f"frontend asset must not use unsafe DOM/code pattern: {relative}: {needle}")
+
+    frontend_server = (ROOT / "scripts" / "frontend-server.py").read_text(encoding="utf-8")
+    required = [
+        'server_version = "FileTransFrontend"',
+        '"Cache-Control", "no-store"',
+        '"X-Content-Type-Options", "nosniff"',
+        '"X-Frame-Options", "DENY"',
+        '"Referrer-Policy", "no-referrer"',
+        '"Cross-Origin-Resource-Policy", "same-origin"',
+        "PUBLIC_ROOT",
+        ".relative_to(PUBLIC_ROOT)",
+        "self.send_error(403)",
+        "def list_directory",
+        "def do_OPTIONS",
+        "def do_TRACE",
+        "def do_POST",
+        "self.send_response(405)",
+        "allow_reuse_address = True",
+        "daemon_threads = True",
+    ]
+    for needle in required:
+        if needle not in frontend_server:
+            fail(f"frontend server missing security setting: {needle}")
+
+
 def main() -> None:
     check_tracked_files()
     check_command_execution()
+    check_conversion_path()
     check_imagemagick_policy()
     check_docker_worker()
     check_ci_workflow()
     check_capabilities()
+    check_frontend()
     print("security audit passed")
 
 

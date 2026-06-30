@@ -10,6 +10,7 @@ import secrets
 import signal
 import shutil
 import socket
+import stat
 import struct
 import subprocess
 import threading
@@ -22,7 +23,7 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlparse
 from xml.etree import ElementTree
 
 try:
@@ -36,11 +37,43 @@ import cgi
 
 ROOT = Path(__file__).resolve().parent
 PUBLIC_DIR = ROOT / "public"
-DATA_DIR = ROOT / "data"
+DATA_DIR = Path(os.environ.get("FILE_TRANS_DATA_DIR", str(ROOT / "data"))).expanduser().resolve()
 UPLOAD_DIR = DATA_DIR / "uploads"
 OUTPUT_DIR = DATA_DIR / "outputs"
 RUNTIME_HOME_DIR = DATA_DIR / "runtime-home"
 IMAGEMAGICK_POLICY_DIR = ROOT / "config" / "imagemagick"
+DEFAULT_CONVERSION_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+
+def normalize_conversion_path(value: str | None) -> str:
+    parts = []
+    seen = set()
+    for item in (value or DEFAULT_CONVERSION_PATH).split(os.pathsep):
+        if not item or item == ".":
+            continue
+        path = Path(item).expanduser()
+        if not path.is_absolute():
+            continue
+        normalized = str(path)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        parts.append(normalized)
+    return os.pathsep.join(parts) or DEFAULT_CONVERSION_PATH
+
+
+def parse_allowed_origins(value: str | None) -> set[str]:
+    origins = set()
+    for item in (value or "").split(","):
+        origin = item.strip().rstrip("/")
+        if not origin:
+            continue
+        parsed = urlparse(origin)
+        if parsed.scheme in {"http", "https"} and parsed.netloc:
+            origins.add(f"{parsed.scheme}://{parsed.netloc}")
+    return origins
+
+
 USE_DOCKER_WORKER = os.environ.get("FILE_TRANS_USE_DOCKER", "").lower() in {"1", "true", "yes", "on"}
 CONVERT_WORKER_IMAGE = os.environ.get("FILE_TRANS_WORKER_IMAGE", "file-trans-convert-worker:latest")
 MAX_UPLOAD_BYTES = int(os.environ.get("FILE_TRANS_MAX_UPLOAD", str(100 * 1024 * 1024)))
@@ -67,6 +100,8 @@ RATE_LIMIT_MAX_UPLOADS = int(os.environ.get("FILE_TRANS_RATE_MAX", "30"))
 HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8000"))
 MAX_FILENAME_CHARS = int(os.environ.get("FILE_TRANS_MAX_FILENAME_CHARS", "180"))
+CONVERSION_PATH = normalize_conversion_path(os.environ.get("FILE_TRANS_CONVERT_PATH"))
+ALLOWED_ORIGINS = parse_allowed_origins(os.environ.get("FILE_TRANS_ALLOWED_ORIGINS"))
 
 DOCUMENT_EXTS = {
     "doc",
@@ -145,7 +180,9 @@ IMAGE_EXTS = {
     "webp",
 }
 EBOOK_EXTS = {"azw3", "cbz", "chm", "djvu", "epub", "fb2", "mobi"}
-EXTERNAL_REF_TEXT_EXTS = {"html", "htm", "fb2"} | MARKUP_EXTS
+FLAT_XML_DOCUMENT_EXTS = {"fodt", "fods", "fodp"}
+XML_TEXT_EXTS = {"xml", "fb2"} | FLAT_XML_DOCUMENT_EXTS
+EXTERNAL_REF_TEXT_EXTS = {"html", "htm", "fb2"} | MARKUP_EXTS | FLAT_XML_DOCUMENT_EXTS
 ZIP_EXTERNAL_REF_EXTS = {"docx", "pptx", "xlsx", "odt", "ods", "odp", "hwpx", "epub"}
 ZIP_REFERENCE_MEMBER_SUFFIXES = (".rels", ".xml", ".html", ".htm", ".xhtml", ".css", ".opf", ".ncx", ".svg")
 
@@ -264,7 +301,7 @@ def stem_for_output(original_name: str) -> str:
 
 def local_tool_path(*names: str) -> str | None:
     for name in names:
-        found = shutil.which(name)
+        found = shutil.which(name, path=CONVERSION_PATH)
         if found:
             return found
     return None
@@ -471,6 +508,32 @@ def capabilities() -> dict:
     }
 
 
+def normalize_origin(origin: str | None) -> str | None:
+    if not origin or origin == "null":
+        return None
+    parsed = urlparse(origin)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def origin_allowed(origin: str | None, host: str | None) -> bool:
+    normalized = normalize_origin(origin)
+    if not normalized or not host:
+        return False
+    if normalized in ALLOWED_ORIGINS:
+        return True
+    return urlparse(normalized).netloc.lower() == host.lower()
+
+
+def request_origin_allowed(origin: str | None, host: str | None, sec_fetch_site: str | None = None) -> bool:
+    if sec_fetch_site and sec_fetch_site.lower() == "cross-site":
+        return False
+    if not origin:
+        return True
+    return origin_allowed(origin, host)
+
+
 def read_text_file(path: Path) -> str:
     for encoding in ("utf-8-sig", "utf-8", "cp949", "euc-kr"):
         try:
@@ -621,6 +684,9 @@ def archive_names(path: Path) -> list[str]:
         parts = [part for part in normalized.split("/") if part]
         if normalized.startswith("/") or any(part == ".." for part in parts):
             raise ConversionError("압축 컨테이너에 안전하지 않은 경로가 포함되어 있습니다.")
+        file_type = (info.external_attr >> 16) & 0o170000
+        if file_type and not (stat.S_ISREG(file_type) or stat.S_ISDIR(file_type)):
+            raise ConversionError("압축 컨테이너에 안전하지 않은 파일 형식이 포함되어 있습니다.")
         total_uncompressed += info.file_size
         if total_uncompressed > MAX_ARCHIVE_UNCOMPRESSED_BYTES:
             raise ConversionError("압축 해제 예상 크기가 제한을 초과했습니다.")
@@ -691,12 +757,14 @@ def is_rtf_like(sample: bytes) -> bool:
 
 
 def text_has_external_reference(text: str) -> bool:
-    text = text[:1024 * 1024].lower()
+    text = text.lower()
     patterns = [
         r"\b(?:src|href|poster|data|target|xlink:href)\s*=\s*['\"]?\s*(?:https?:|file:|ftp:|//)",
         r"@import\s+(?:url\()?['\"]?\s*(?:https?:|file:|ftp:|//)",
         r"url\(\s*['\"]?\s*(?:https?:|file:|ftp:|//)",
         r"\]\(\s*(?:https?:|file:|ftp:|//)",
+        r"(?m)^\s*\[[^\]]+\]:\s*(?:https?:|file:|ftp:|//)",
+        r"<\s*(?:https?:|file:|ftp:|//)",
         r"\\(?:includegraphics|input|include)\s*\{\s*(?:https?:|file:|ftp:|//)",
         r"\\(?:href|url)\s*\{\s*(?:https?:|file:|ftp:|//)",
         r"(?m)^\s*\.\.\s+(?:image|figure|include)::\s*(?:https?:|file:|ftp:|//)",
@@ -708,6 +776,15 @@ def text_has_external_reference(text: str) -> bool:
 
 def has_external_text_reference(path: Path) -> bool:
     return text_has_external_reference(read_text_file(path))
+
+
+def bytes_have_xml_dtd_or_entity(data: bytes) -> bool:
+    upper = data.upper()
+    return b"<!DOCTYPE" in upper or b"<!ENTITY" in upper
+
+
+def path_has_xml_dtd_or_entity(path: Path) -> bool:
+    return bytes_have_xml_dtd_or_entity(path.read_bytes())
 
 
 def zip_has_external_text_reference(path: Path) -> bool:
@@ -896,6 +973,8 @@ def validate_upload_file(path: Path, original_name: str, size: int, digest: str)
     detected = detect_magic(path, ext)
     if detected == "unknown":
         raise ConversionError("파일 내용이 확장자와 일치하지 않거나 지원하지 않는 형식입니다.")
+    if ext in XML_TEXT_EXTS and path_has_xml_dtd_or_entity(path):
+        raise ConversionError("DTD 또는 ENTITY가 포함된 XML은 처리하지 않습니다.")
     if ext in EXTERNAL_REF_TEXT_EXTS and has_external_text_reference(path):
         raise ConversionError("외부 리소스를 참조하는 마크업 파일은 변환할 수 없습니다.")
     if ext in ZIP_EXTERNAL_REF_EXTS and zip_has_external_text_reference(path):
@@ -1099,8 +1178,7 @@ def local_name(tag: str) -> str:
 
 
 def parse_safe_xml(data: bytes):
-    upper = data[:4096].upper()
-    if b"<!DOCTYPE" in upper or b"<!ENTITY" in upper:
+    if bytes_have_xml_dtd_or_entity(data):
         raise ConversionError("DTD 또는 ENTITY가 포함된 XML은 처리하지 않습니다.")
     return ElementTree.fromstring(data)
 
@@ -1666,7 +1744,7 @@ def limited_preexec(timeout: int):
 
 def conversion_env(extra_env: dict | None = None) -> dict:
     env = {
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "PATH": CONVERSION_PATH,
         "LANG": os.environ.get("LANG", "C.UTF-8"),
         "LC_ALL": os.environ.get("LC_ALL", os.environ.get("LANG", "C.UTF-8")),
         "HOME": str(RUNTIME_HOME_DIR),
@@ -2117,7 +2195,16 @@ class FileTransHandler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+        self.send_header("X-Permitted-Cross-Domain-Policies", "none")
         self.send_header("Content-Security-Policy", "default-src 'self'; object-src 'none'; frame-ancestors 'none'")
+        origin = self.headers.get("Origin")
+        if origin and origin_allowed(origin, self.headers.get("Host")):
+            self.send_header("Access-Control-Allow-Origin", normalize_origin(origin) or origin)
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, HEAD, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Vary", "Origin")
 
     def send_json(self, payload: dict, status: HTTPStatus = HTTPStatus.OK) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -2157,6 +2244,13 @@ class FileTransHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_OPTIONS(self) -> None:
+        if self.headers.get("Origin") and not request_origin_allowed(
+            self.headers.get("Origin"),
+            self.headers.get("Host"),
+            self.headers.get("Sec-Fetch-Site"),
+        ):
+            self.send_error(HTTPStatus.FORBIDDEN)
+            return
         self.send_response(HTTPStatus.NO_CONTENT)
         self.send_header("Allow", "GET, POST, HEAD, OPTIONS")
         self.send_header("Content-Length", "0")
@@ -2289,6 +2383,13 @@ class FileTransHandler(BaseHTTPRequestHandler):
         if "multipart/form-data" not in self.headers.get("Content-Type", ""):
             self.send_error_json("multipart/form-data 요청만 지원합니다.")
             return
+        if not request_origin_allowed(
+            self.headers.get("Origin"),
+            self.headers.get("Host"),
+            self.headers.get("Sec-Fetch-Site"),
+        ):
+            self.send_error_json("허용되지 않은 요청 출처입니다.", HTTPStatus.FORBIDDEN)
+            return
         if not rate_limiter.allow(self.client_ip()):
             self.send_error_json("요청이 너무 많습니다. 잠시 후 다시 시도하세요.", HTTPStatus.TOO_MANY_REQUESTS)
             return
@@ -2340,12 +2441,12 @@ class FileTransHandler(BaseHTTPRequestHandler):
         try:
             size, digest = copy_stream_limited(file_item.file, input_path, MAX_UPLOAD_BYTES)
             source = validate_upload_file(input_path, original_name, size, digest)
-            scan_upload_for_malware(input_path)
             if target not in targets_for_extension(source.ext):
                 raise ConversionError(f".{source.ext} 파일은 .{target} 형식으로 변환할 수 없습니다.")
             conversion_slot_acquired = conversion_slots.acquire(blocking=False)
             if not conversion_slot_acquired:
                 raise ConversionBusyError("동시 변환 제한에 도달했습니다. 잠시 후 다시 시도하세요.")
+            scan_upload_for_malware(input_path)
             output_path = convert_file(input_path, original_name, target, job_output_dir)
             if output_path.stat().st_size > MAX_OUTPUT_BYTES:
                 raise ConversionError("변환 결과 파일 크기가 제한을 초과했습니다.")
