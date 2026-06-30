@@ -59,6 +59,24 @@ class SecurityValidationTests(unittest.TestCase):
         self.assertGreaterEqual(capabilities["inputFormatCount"], 40)
         self.assertGreaterEqual(capabilities["targetFormatCount"], 20)
 
+    def test_download_tokens_are_redacted_from_logs(self):
+        text = (
+            '"GET /download/0123456789abcdef0123456789abcdef/'
+            'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN0123456789_a/file.txt HTTP/1.1" 200 -'
+        )
+        redacted = server.redact_log_text(text)
+        self.assertIn("/download/0123456789abcdef0123456789abcdef/<token>/file.txt", redacted)
+        self.assertNotIn("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN0123456789_a", redacted)
+
+    def test_download_metadata_does_not_store_original_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "secret-contract.txt"
+            output_path.write_text("result", encoding="utf-8")
+            source = server.FileValidation(ext="txt", detected="text", size=6, sha256=hashlib.sha256(b"source").hexdigest())
+            metadata = server.create_download_metadata("0" * 32, output_path, source)
+            self.assertNotIn("originalName", metadata)
+            self.assertEqual(metadata["outputName"], "secret-contract.txt")
+
 
 if __name__ == "__main__":
     unittest.main()

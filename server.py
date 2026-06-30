@@ -800,7 +800,6 @@ def metadata_path(job_output_dir: Path) -> Path:
 def create_download_metadata(
     job_id: str,
     output_path: Path,
-    original_name: str,
     source: FileValidation,
 ) -> dict:
     token = secrets.token_urlsafe(32)
@@ -812,7 +811,6 @@ def create_download_metadata(
         "jobId": job_id,
         "token": token,
         "outputName": output_path.name,
-        "originalName": original_name,
         "sourceExt": source.ext,
         "sourceDetected": source.detected,
         "sourceSize": source.size,
@@ -1481,6 +1479,10 @@ def clean_process_output(text: str) -> str:
     return text[-1200:] if text else "알 수 없는 변환 오류"
 
 
+def redact_log_text(text: str) -> str:
+    return re.sub(r"(/download/[0-9a-f]{32}/)[A-Za-z0-9_-]{32,96}(/)", r"\1<token>\2", text)
+
+
 def limited_preexec(timeout: int):
     if resource is None or os.name != "posix":
         return None
@@ -1938,7 +1940,7 @@ class FileTransHandler(BaseHTTPRequestHandler):
     server_version = "FileTrans/0.1"
 
     def log_message(self, fmt: str, *args) -> None:
-        message = clean_process_output(fmt % args)
+        message = redact_log_text(clean_process_output(fmt % args))
         print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {self.client_ip()} {message}")
 
     def client_ip(self) -> str:
@@ -2126,7 +2128,7 @@ class FileTransHandler(BaseHTTPRequestHandler):
             output_path = convert_file(input_path, original_name, target, job_output_dir)
             if output_path.stat().st_size > MAX_OUTPUT_BYTES:
                 raise ConversionError("변환 결과 파일 크기가 제한을 초과했습니다.")
-            metadata = create_download_metadata(job_id, output_path, original_name, source)
+            metadata = create_download_metadata(job_id, output_path, source)
         except ConversionError as exc:
             remove_tree(job_output_dir)
             error_message = str(exc)
