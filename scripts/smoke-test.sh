@@ -51,6 +51,9 @@ CONVERT_RESPONSE="$(
 )"
 DOWNLOAD_URL="$(printf '%s' "${CONVERT_RESPONSE}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["downloadUrl"])')"
 printf '%s' "${DOWNLOAD_URL}" | grep -Eq '^/download/[0-9a-f]{32}/[A-Za-z0-9_-]{32,96}/scores\.json$'
+BAD_DOWNLOAD_URL="$(printf '%s' "${DOWNLOAD_URL}" | sed -E 's#/download/([0-9a-f]{32})/[^/]+/#/download/\\1/not-a-valid-token/#')"
+BAD_DOWNLOAD_STATUS="$(curl -sS -o "${TMP_DIR}/bad-download.txt" -w '%{http_code}' "${BASE_URL}${BAD_DOWNLOAD_URL}")"
+[[ "${BAD_DOWNLOAD_STATUS}" == "404" ]]
 curl -fsS "${BASE_URL}${DOWNLOAD_URL}" -o "${TMP_DIR}/scores.json"
 grep -q '"name": "kim"' "${TMP_DIR}/scores.json"
 

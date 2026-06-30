@@ -2037,6 +2037,11 @@ class FileTransHandler(BaseHTTPRequestHandler):
         if file_path.stat().st_size != int(metadata.get("outputSize", -1)):
             self.send_error(HTTPStatus.GONE)
             return
+        with file_path.open("rb") as handle:
+            current_sha256 = hashlib.file_digest(handle, "sha256").hexdigest()
+        if not secrets.compare_digest(current_sha256, str(metadata.get("outputSha256", ""))):
+            self.send_error(HTTPStatus.GONE)
+            return
         content_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
