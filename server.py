@@ -91,7 +91,7 @@ MAX_CONVERSION_SECONDS = int(os.environ.get("FILE_TRANS_CONVERT_TIMEOUT", "60"))
 RESULT_TTL_SECONDS = int(os.environ.get("FILE_TRANS_RESULT_TTL", str(24 * 60 * 60)))
 CLEANUP_INTERVAL_SECONDS = int(os.environ.get("FILE_TRANS_CLEANUP_INTERVAL", "600"))
 MAX_OUTPUT_BYTES = int(os.environ.get("FILE_TRANS_MAX_OUTPUT", str(1024 * 1024 * 1024)))
-MAX_PROCESS_MEMORY_BYTES = int(os.environ.get("FILE_TRANS_PROCESS_MEMORY", str(1024 * 1024 * 1024)))
+MAX_PROCESS_MEMORY_BYTES = int(os.environ.get("FILE_TRANS_PROCESS_MEMORY", str(4 * 1024 * 1024 * 1024)))
 MAX_PROCESS_FILES = int(os.environ.get("FILE_TRANS_PROCESS_FILES", "128"))
 MAX_PROCESS_COUNT = int(os.environ.get("FILE_TRANS_PROCESS_COUNT", "96"))
 MAX_CONCURRENT_CONVERSIONS = int(os.environ.get("FILE_TRANS_MAX_CONCURRENT", "2"))
@@ -2067,7 +2067,7 @@ def convert_with_libreoffice(input_path: Path, output_path: Path, target: str) -
         str(input_path),
     ]
     try:
-        run_checked(
+        result = run_checked(
             command,
             timeout=max(MAX_CONVERSION_SECONDS, 90),
             cwd=outdir,
@@ -2079,7 +2079,8 @@ def convert_with_libreoffice(input_path: Path, output_path: Path, target: str) -
         if not expected.exists():
             matches = sorted(outdir.glob(f"*.{target}"), key=lambda item: item.stat().st_mtime, reverse=True)
             if not matches:
-                raise ConversionError("LibreOffice 변환 결과 파일을 찾지 못했습니다.")
+                detail = clean_process_output(result.stderr or result.stdout)
+                raise ConversionError(f"LibreOffice 변환 결과 파일을 찾지 못했습니다: {detail}")
             expected = matches[0]
         if expected != output_path:
             expected.replace(output_path)
