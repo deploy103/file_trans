@@ -127,15 +127,121 @@ const downloadZipButton = document.querySelector("#downloadZipButton");
 const toolStatus = document.querySelector("#toolStatus");
 const batchOptions = document.querySelector("#batchOptions");
 const imagePdfOptions = document.querySelector("#imagePdfOptions");
+const zipOptions = document.querySelector("#zipOptions");
+const imageOptions = document.querySelector("#imageOptions");
+const audioOptions = document.querySelector("#audioOptions");
+const videoOptions = document.querySelector("#videoOptions");
+const pdfImageOptions = document.querySelector("#pdfImageOptions");
 const pdfPageSize = document.querySelector("#pdfPageSize");
 const pdfOrientation = document.querySelector("#pdfOrientation");
 const pdfMargin = document.querySelector("#pdfMargin");
+const pdfQuality = document.querySelector("#pdfQuality");
+const zipLevelSelect = document.querySelector("#zipLevel");
+const imageQualityInput = document.querySelector("#imageQuality");
+const audioBitrateSelect = document.querySelector("#audioBitrate");
+const videoQualitySelect = document.querySelector("#videoQuality");
+const pdfDpiInput = document.querySelector("#pdfDpi");
 const routeBadge = document.querySelector("#routeBadge");
 const routeSubtitle = document.querySelector("#routeSubtitle");
 const dropTitle = document.querySelector("#dropTitle");
 const dropMeta = document.querySelector("#dropMeta");
 const navHome = document.querySelector("[data-nav-home]");
 const navTools = document.querySelector("[data-nav-tools]");
+
+const OPTION_PANELS = {
+  zip: zipOptions,
+  imagePdf: imagePdfOptions,
+  image: imageOptions,
+  audio: audioOptions,
+  video: videoOptions,
+  pdfImage: pdfImageOptions,
+};
+
+function capabilitiesOptions() {
+  return state.capabilities?.options || {};
+}
+
+function optionPanelsForPreset(preset) {
+  if (!preset) return [];
+  if (preset.to === "zip") return ["zip"];
+  if (preset.from === "image" && preset.to === "pdf") return ["imagePdf"];
+  if (preset.from === "pdf" && (preset.to === "jpg" || preset.to === "png")) return ["pdfImage"];
+  if ((isVideoSource(preset.from) || isAudioSource(preset.from)) && isAudioTarget(preset.to)) {
+    return ["audio"];
+  }
+  if (isVideoSource(preset.from) && isVideoTarget(preset.to)) {
+    return ["video"];
+  }
+  if (isImageSource(preset.from) && isImageTarget(preset.to)) {
+    return ["image"];
+  }
+  return [];
+}
+
+function isAudioSource(token) {
+  return ["audio", "mp3", "wav", "m4a", "flac", "aac", "ogg", "opus"].includes(token);
+}
+
+function isVideoSource(token) {
+  return ["video", "3g2", "3gp", "avi", "flv", "m2ts", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg", "mts", "ogv", "ts", "webm", "wmv"].includes(token);
+}
+
+function isAudioTarget(token) {
+  return ["mp3", "wav", "m4a", "flac", "aac", "ogg", "opus"].includes(token);
+}
+
+function isVideoTarget(token) {
+  return ["mp4", "webm", "mkv", "mov", "gif"].includes(token);
+}
+
+function isImageSource(token) {
+  return ["image", "jpg", "jpeg", "png", "webp", "heic", "avif", "bmp", "tiff", "tif"].includes(token);
+}
+
+function isImageTarget(token) {
+  return ["jpg", "jpeg", "png", "webp", "avif", "tiff", "tif", "ico"].includes(token);
+}
+
+function applyDefaultOptionValues() {
+  const opts = capabilitiesOptions();
+  if (zipLevelSelect) {
+    const def = opts.defaultZipLevel || "normal";
+    Array.from(zipLevelSelect.options).forEach((option) => {
+      option.selected = option.value === def;
+    });
+  }
+  if (imageQualityInput) {
+    const def = opts.imageQuality?.default ?? 85;
+    imageQualityInput.value = String(def);
+  }
+  if (pdfQuality) {
+    pdfQuality.value = String(opts.imageQuality?.default ?? 85);
+  }
+  if (audioBitrateSelect) {
+    const def = opts.defaultAudioBitrate || "normal";
+    Array.from(audioBitrateSelect.options).forEach((option) => {
+      option.selected = option.value === def;
+    });
+  }
+  if (videoQualitySelect) {
+    const def = opts.defaultVideoQuality || "normal";
+    Array.from(videoQualitySelect.options).forEach((option) => {
+      option.selected = option.value === def;
+    });
+  }
+  if (pdfDpiInput) {
+    pdfDpiInput.value = String(opts.pdfDpi?.default ?? 160);
+  }
+}
+
+function showOptionPanels(preset) {
+  const panels = optionPanelsForPreset(preset);
+  Object.entries(OPTION_PANELS).forEach(([key, panel]) => {
+    if (!panel) return;
+    panel.hidden = !panels.includes(key);
+  });
+  batchOptions.hidden = panels.length === 0;
+}
 
 function apiUrl(path) {
   return `${API_BASE}${path}`;
@@ -209,6 +315,27 @@ function targetsForExt(ext) {
 function usesBatchConversion() {
   if (!state.preset) return false;
   return state.preset.to === "zip" || (state.preset.from === "image" && state.preset.to === "pdf");
+}
+
+function appendPresetOptions(formData, preset) {
+  if (!preset) return;
+  if (preset.to === "zip" && zipLevelSelect) {
+    formData.append("zipLevel", zipLevelSelect.value);
+  }
+  if (preset.from === "image" && preset.to === "pdf") {
+    if (pdfPageSize) formData.append("pdfPageSize", pdfPageSize.value);
+    if (pdfOrientation) formData.append("pdfOrientation", pdfOrientation.value);
+    if (pdfMargin) formData.append("pdfMargin", pdfMargin.value);
+    if (pdfQuality) formData.append("imageQuality", pdfQuality.value);
+  } else if (preset.from === "pdf" && (preset.to === "jpg" || preset.to === "png")) {
+    if (pdfDpiInput) formData.append("pdfDpi", pdfDpiInput.value);
+  } else if (isImageSource(preset.from) && isImageTarget(preset.to)) {
+    if (imageQualityInput) formData.append("imageQuality", imageQualityInput.value);
+  } else if ((isAudioSource(preset.from) || isVideoSource(preset.from)) && isAudioTarget(preset.to)) {
+    if (audioBitrateSelect) formData.append("audioBitrate", audioBitrateSelect.value);
+  } else if (isVideoSource(preset.from) && isVideoTarget(preset.to)) {
+    if (videoQualitySelect) formData.append("videoQuality", videoQualitySelect.value);
+  }
 }
 
 function relativePathForFile(file) {
@@ -364,6 +491,7 @@ function showConverter(preset) {
       : `허용 입력: ${extList.slice(0, 8).map((ext) => `.${ext}`).join(", ")}${extList.length > 8 ? "..." : ""} · 파일당 최대 ${formatBytes(maxBytes)} · 최대 ${MAX_SELECTED_FILES}개`;
   }
 
+  showOptionPanels(preset);
   renderWorkspace();
   if (preset.unavailable || !toolAvailable(preset)) {
     addInvalidFileMessage("현재 설치된 변환 엔진으로는 이 변환을 사용할 수 없습니다.");
@@ -468,8 +596,7 @@ function renderWorkspace() {
 
   if (!hasFiles) {
     workspaceStatusText.textContent = "변환할 파일을 추가하고 시작 버튼을 눌러주세요.";
-    batchOptions.hidden = true;
-    imagePdfOptions.hidden = true;
+    showOptionPanels(null);
     addFolderButton.hidden = true;
     convertButton.lastChild.textContent = "변환 시작";
     return;
@@ -503,8 +630,14 @@ function renderWorkspace() {
   convertButton.disabled = state.converting || readyCount === 0;
   downloadZipButton.hidden = state.preset?.to === "zip" || doneFiles().length < 2;
   addFolderButton.hidden = state.preset?.to !== "zip";
-  batchOptions.hidden = !isBatch || state.converting || actionDone.hidden === false;
-  imagePdfOptions.hidden = !(state.preset?.from === "image" && state.preset?.to === "pdf");
+  if (!state.converting && actionDone.hidden === false) {
+    showOptionPanels(null);
+  } else if (!state.converting) {
+    showOptionPanels(state.preset);
+  } else {
+    batchOptions.hidden = true;
+    Object.values(OPTION_PANELS).forEach((panel) => panel && (panel.hidden = true));
+  }
   convertButton.lastChild.textContent = isBatch
     ? (state.preset?.to === "zip" ? "ZIP 만들기" : "PDF로 합치기")
     : "변환 시작";
@@ -619,6 +752,7 @@ async function convertOne(item) {
   const formData = new FormData();
   formData.append("file", item.file);
   formData.append("target", state.preset.to);
+  appendPresetOptions(formData, state.preset);
 
   try {
     const response = await fetch(apiUrl("/convert"), {
@@ -662,11 +796,7 @@ async function convertBatch(items) {
     formData.append("relativePath", item.relativePath || item.file.name);
   }
   formData.append("target", state.preset.to);
-  if (state.preset.from === "image" && state.preset.to === "pdf") {
-    formData.append("pdfPageSize", pdfPageSize.value);
-    formData.append("pdfOrientation", pdfOrientation.value);
-    formData.append("pdfMargin", pdfMargin.value);
-  }
+  appendPresetOptions(formData, state.preset);
 
   try {
     const response = await fetch(apiUrl("/convert"), {
@@ -1012,6 +1142,7 @@ async function loadCapabilities() {
   const data = await response.json();
   if (!response.ok || !data.ok) throw new Error(data.error || "capabilities failed");
   state.capabilities = data;
+  applyDefaultOptionValues();
   renderTools();
   renderToolGrid();
   renderRoute();

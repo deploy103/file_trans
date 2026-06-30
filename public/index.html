@@ -80,13 +80,27 @@
         </section>
 
         <section id="batchOptions" class="batch-options" hidden>
+          <div id="zipOptions" class="option-grid" hidden>
+            <label>
+              <span>압축 수준</span>
+              <select id="zipLevel" name="zipLevel">
+                <option value="store">저장 (무압축)</option>
+                <option value="fast">빠름</option>
+                <option value="normal" selected>보통</option>
+                <option value="max">최대</option>
+              </select>
+            </label>
+          </div>
           <div id="imagePdfOptions" class="option-grid" hidden>
             <label>
               <span>페이지</span>
               <select id="pdfPageSize" name="pdfPageSize">
                 <option value="fit">이미지 크기</option>
+                <option value="a3">A3</option>
                 <option value="a4">A4</option>
+                <option value="a5">A5</option>
                 <option value="letter">Letter</option>
+                <option value="legal">Legal</option>
               </select>
             </label>
             <label>
@@ -104,6 +118,42 @@
                 <option value="small">작게</option>
                 <option value="large">크게</option>
               </select>
+            </label>
+            <label>
+              <span>이미지 품질</span>
+              <input id="pdfQuality" name="pdfQuality" type="number" min="1" max="100" value="85">
+            </label>
+          </div>
+          <div id="imageOptions" class="option-grid" hidden>
+            <label>
+              <span>품질</span>
+              <input id="imageQuality" name="imageQuality" type="number" min="1" max="100" value="85">
+            </label>
+          </div>
+          <div id="audioOptions" class="option-grid" hidden>
+            <label>
+              <span>비트레이트</span>
+              <select id="audioBitrate" name="audioBitrate">
+                <option value="low">낮음 (96k)</option>
+                <option value="normal" selected>보통 (192k)</option>
+                <option value="high">높음 (320k)</option>
+              </select>
+            </label>
+          </div>
+          <div id="videoOptions" class="option-grid" hidden>
+            <label>
+              <span>품질</span>
+              <select id="videoQuality" name="videoQuality">
+                <option value="low">낮음</option>
+                <option value="normal" selected>보통</option>
+                <option value="high">높음</option>
+              </select>
+            </label>
+          </div>
+          <div id="pdfImageOptions" class="option-grid" hidden>
+            <label>
+              <span>DPI</span>
+              <input id="pdfDpi" name="pdfDpi" type="number" min="50" max="600" value="160">
             </label>
           </div>
         </section>

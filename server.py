@@ -2,6 +2,7 @@
 import csv
 import hashlib
 import html
+import io
 import json
 import mimetypes
 import os
@@ -17,7 +18,6 @@ import threading
 import time
 import unicodedata
 import uuid
-import warnings
 import zipfile
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -31,8 +31,8 @@ try:
 except ImportError:  # pragma: no cover - Windows fallback
     resource = None
 
-warnings.filterwarnings("ignore", category=DeprecationWarning, message="'cgi' is deprecated.*")
-import cgi
+# ``cgi`` 모듈은 Python 3.13에서 제거됐습니다. 서버 내부에서 ``MultipartForm``을
+# 직접 사용하기 때문에 더 이상 import할 필요가 없습니다.
 
 
 ROOT = Path(__file__).resolve().parent
@@ -581,6 +581,19 @@ def capabilities() -> dict:
         "malwareScanTimeoutSeconds": CLAMSCAN_TIMEOUT_SECONDS,
         "hwpFilterAvailable": hwp_filter_available(),
         "resultTtlSeconds": RESULT_TTL_SECONDS,
+        "options": {
+            "zipLevels": sorted(ALLOWED_ZIP_LEVELS),
+            "defaultZipLevel": DEFAULT_ZIP_LEVEL,
+            "imageQuality": {"min": 1, "max": 100, "default": DEFAULT_IMAGE_QUALITY},
+            "pdfDpi": {"min": 50, "max": 600, "default": DEFAULT_PDF_DPI},
+            "pdfPageSizes": sorted(ALLOWED_PDF_PAGE_SIZES - {"fit"}),
+            "pdfOrientations": sorted(ALLOWED_PDF_ORIENTATIONS),
+            "pdfMargins": sorted(ALLOWED_PDF_MARGINS),
+            "audioBitrates": sorted(AUDIO_BITRATE_PRESETS),
+            "defaultAudioBitrate": DEFAULT_AUDIO_BITRATE,
+            "videoQualities": sorted(ALLOWED_VIDEO_QUALITIES),
+            "defaultVideoQuality": DEFAULT_VIDEO_QUALITY,
+        },
     }
 
 
@@ -1067,7 +1080,150 @@ def validate_zip_upload_file(original_name: str, size: int, digest: str) -> File
     return FileValidation(ext=ext, detected="raw", size=size, sha256=digest)
 
 
-def form_file_items(form: cgi.FieldStorage) -> list:
+class MultipartFileItem:
+    """단일 multipart 파일 항목을 표현합니다."""
+
+    __slots__ = ("filename", "file", "content_type")
+
+    def __init__(self, filename: str, stream, content_type: str = "application/octet-stream"):
+        self.filename = filename
+        self.file = stream
+        self.content_type = content_type
+
+    def __repr__(self) -> str:
+        return f"MultipartFileItem(filename={self.filename!r})"
+
+
+class MultipartForm:
+    """``multipart/form-data`` 요청을 파싱해 ``cgi.FieldStorage``과 유사한 API를 제공합니다.
+
+    ``cgi`` 모듈은 Python 3.13에서 제거됐기 때문에 HTTP 요청 본문을 직접 파싱합니다.
+    ``getfirst``/``getlist``/``__getitem__``/``__contains__`` 만 사용하도록 호출
+    사이트를 제한해 구현을 단순화했습니다.
+    """
+
+    def __init__(self, fp, content_type: str, content_length: int):
+        self._text_values: dict[str, list[str]] = {}
+        self._file_values: dict[str, list[MultipartFileItem]] = {}
+        self._parse(fp, content_type, content_length)
+
+    @staticmethod
+    def _extract_boundary(content_type: str) -> str | None:
+        match = re.search(
+            r"""boundary=(?:"([^"]+)"|([^;\s]+))""",
+            content_type,
+            re.IGNORECASE,
+        )
+        if not match:
+            return None
+        return match.group(1) or match.group(2)
+
+    def _parse(self, fp, content_type: str, content_length: int) -> None:
+        boundary = self._extract_boundary(content_type)
+        if not boundary:
+            return
+        try:
+            boundary_bytes = boundary.encode("ascii")
+        except UnicodeEncodeError:
+            return
+        if content_length and content_length > 0:
+            data = fp.read(content_length)
+        else:
+            data = fp.read()
+        if not data:
+            return
+
+        # CRLF를 앞에 붙여서 첫 경계도 동일한 구분자로 자를 수 있도록 합니다.
+        sections = (b"\r\n" + data).split(b"\r\n--" + boundary_bytes)
+        # sections[0] = 선행 CRLF만, sections[-1] = 종결 마커("--\r\n") 영역
+        for index, section in enumerate(sections):
+            if index == 0:
+                # 선행 영역
+                continue
+            if section.startswith(b"--"):
+                # 종결 마커 또는 epilogue
+                continue
+            if not section:
+                continue
+            if section.startswith(b"\r\n"):
+                section = section[2:]
+            sep = section.find(b"\r\n\r\n")
+            if sep < 0:
+                continue
+            headers_text = section[:sep].decode("ascii", errors="replace")
+            body = section[sep + 4 :]
+            headers = self._parse_headers(headers_text)
+            disposition = self._parse_content_disposition(headers.get("content-disposition", ""))
+            name = disposition.get("name", "")
+            if not name:
+                continue
+            part_content_type = headers.get("content-type", "application/octet-stream")
+            if "filename" in disposition or "filename*" in disposition:
+                filename = disposition.get("filename", "") or ""
+                filename = filename.split("/")[-1].split("\\")[-1]
+                self._file_values.setdefault(name, []).append(
+                    MultipartFileItem(filename, io.BytesIO(body), part_content_type)
+                )
+            else:
+                value = body.decode("utf-8", errors="replace")
+                self._text_values.setdefault(name, []).append(value)
+
+    @staticmethod
+    def _parse_headers(text: str) -> dict[str, str]:
+        result: dict[str, str] = {}
+        for line in text.split("\r\n"):
+            if ":" in line:
+                key, value = line.split(":", 1)
+                result[key.strip().lower()] = value.strip()
+        return result
+
+    @staticmethod
+    def _parse_content_disposition(value: str) -> dict[str, str]:
+        result: dict[str, str] = {}
+        for part in value.split(";"):
+            part = part.strip()
+            if not part or "=" not in part:
+                continue
+            key, val = part.split("=", 1)
+            key = key.strip().lower()
+            val = val.strip()
+            if val.startswith('"') and val.endswith('"'):
+                val = val[1:-1]
+            elif val.startswith("'") and val.endswith("'"):
+                val = val[1:-1]
+            result[key] = val
+        return result
+
+    def __contains__(self, name: str) -> bool:
+        return name in self._text_values or name in self._file_values
+
+    def __getitem__(self, name: str):
+        if name in self._file_values:
+            items = self._file_values[name]
+            return items[0] if len(items) == 1 else items
+        if name in self._text_values:
+            values = self._text_values[name]
+            return values[0] if len(values) == 1 else values
+        raise KeyError(name)
+
+    def getfirst(self, name: str):
+        if name in self._file_values:
+            return self._file_values[name][0]
+        if name in self._text_values:
+            return self._text_values[name][0]
+        return None
+
+    def getlist(self, name: str) -> list:
+        if name in self._file_values and name in self._text_values:
+            return [*self._text_values[name], *self._file_values[name]]
+        if name in self._file_values:
+            return [*self._file_values[name]]
+        if name in self._text_values:
+            return [*self._text_values[name]]
+        return []
+
+
+def form_file_items(form: MultipartForm) -> list[MultipartFileItem]:
     if "file" not in form:
         return []
     items = form["file"]
@@ -1076,7 +1232,7 @@ def form_file_items(form: cgi.FieldStorage) -> list:
     return [item for item in items if getattr(item, "filename", "")]
 
 
-def form_text_values(form: cgi.FieldStorage, name: str) -> list[str]:
+def form_text_values(form: MultipartForm, name: str) -> list[str]:
     if name not in form:
         return []
     values = form.getlist(name)
@@ -1143,7 +1299,7 @@ def batch_output_name(files: list[UploadedFile], target: str) -> str:
     return f"converted.{target}"
 
 
-def form_option(form: cgi.FieldStorage, name: str, allowed: set[str], default: str) -> str:
+def form_option(form: MultipartForm, name: str, allowed: set[str], default: str) -> str:
     value = (form.getfirst(name) or default).lower().strip()
     return value if value in allowed else default
 
@@ -1152,23 +1308,40 @@ def convert_uploaded_files(
     files: list[UploadedFile],
     target: str,
     job_output_dir: Path,
-    form: cgi.FieldStorage,
+    form: MultipartForm,
 ) -> Path:
+    zip_level = form_option(form, "zipLevel", ALLOWED_ZIP_LEVELS, DEFAULT_ZIP_LEVEL)
+    image_quality = parse_image_quality(form.getfirst("imageQuality"))
+    audio_bitrate_kbps = parse_audio_bitrate(form.getfirst("audioBitrate"))
+    video_quality = parse_video_quality(form.getfirst("videoQuality"))
+    pdf_dpi = parse_pdf_dpi(form.getfirst("pdfDpi"))
+
     if target == "zip":
         output_path = job_output_dir / batch_output_name(files, "zip")
-        zip_uploaded_files(files, output_path)
+        zip_uploaded_files(files, output_path, level=zip_level)
     elif target == "pdf" and all(item.validation.ext in IMAGE_EXTS for item in files):
         output_path = job_output_dir / batch_output_name(files, "pdf")
         convert_images_to_pdf(
             files,
             output_path,
-            page_size=form_option(form, "pdfPageSize", {"fit", "a4", "letter"}, "fit"),
-            orientation=form_option(form, "pdfOrientation", {"auto", "portrait", "landscape"}, "auto"),
-            margin=form_option(form, "pdfMargin", {"none", "small", "large"}, "none"),
+            page_size=form_option(form, "pdfPageSize", ALLOWED_PDF_PAGE_SIZES, "fit"),
+            orientation=form_option(form, "pdfOrientation", ALLOWED_PDF_ORIENTATIONS, "auto"),
+            margin=form_option(form, "pdfMargin", ALLOWED_PDF_MARGINS, "none"),
+            quality=image_quality,
         )
     elif len(files) == 1:
         item = files[0]
-        output_path = convert_file(item.path, item.original_name, target, job_output_dir)
+        output_path = convert_file(
+            item.path,
+            item.original_name,
+            target,
+            job_output_dir,
+            image_quality=image_quality,
+            audio_bitrate_kbps=audio_bitrate_kbps,
+            video_quality=video_quality,
+            pdf_dpi=pdf_dpi,
+            zip_level=zip_level,
+        )
     else:
         raise ConversionError("이 변환은 여러 파일을 하나의 결과로 합치는 방식을 지원하지 않습니다.")
 
@@ -1861,26 +2034,72 @@ def convert_text_to_pdf(input_path: Path, output_path: Path, original_name: str)
     make_text_pdf(text, output_path, Path(original_name).stem)
 
 
-def zip_single_file(input_path: Path, output_path: Path, original_name: str) -> None:
-    with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+# ZIP 압축 옵션. 키 = 옵션 이름, 값 = (압축 알고리즘, 압축 레벨).
+# ``store`` 는 무압축이고 나머지는 zlib(deflate)을 사용합니다.
+ZIP_COMPRESSION_OPTIONS: dict[str, tuple[int, int]] = {
+    "store": (zipfile.ZIP_STORED, 0),
+    "fast": (zipfile.ZIP_DEFLATED, 3),
+    "normal": (zipfile.ZIP_DEFLATED, 6),
+    "max": (zipfile.ZIP_DEFLATED, 9),
+}
+
+# ZIP 옵션 기본값 (bandizip의 "보통" 수준과 동일).
+DEFAULT_ZIP_LEVEL = "normal"
+ALLOWED_ZIP_LEVELS: set[str] = set(ZIP_COMPRESSION_OPTIONS)
+
+
+def open_zip_archive(
+    output_path: Path,
+    level: str = DEFAULT_ZIP_LEVEL,
+) -> zipfile.ZipFile:
+    """옵션에 맞춰 ZIP 아카이브를 엽니다."""
+
+    if level not in ZIP_COMPRESSION_OPTIONS:
+        level = DEFAULT_ZIP_LEVEL
+    compression, compresslevel = ZIP_COMPRESSION_OPTIONS[level]
+    return zipfile.ZipFile(
+        output_path,
+        "w",
+        compression=compression,
+        compresslevel=compresslevel if compresslevel else None,
+    )
+
+
+def zip_single_file(
+    input_path: Path,
+    output_path: Path,
+    original_name: str,
+    level: str = DEFAULT_ZIP_LEVEL,
+) -> None:
+    with open_zip_archive(output_path, level=level) as archive:
         archive.write(input_path, arcname=original_name)
 
 
-def zip_uploaded_files(files: list[UploadedFile], output_path: Path) -> None:
+def zip_uploaded_files(
+    files: list[UploadedFile],
+    output_path: Path,
+    level: str = DEFAULT_ZIP_LEVEL,
+) -> None:
     if not files:
         raise ConversionError("ZIP으로 묶을 파일을 선택하세요.")
     used_names: set[str] = set()
-    with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+    with open_zip_archive(output_path, level=level) as archive:
         for item in files:
             archive.write(item.path, arcname=unique_archive_name(item.archive_name, used_names))
 
 
 def image_pdf_geometry(page_size: str, orientation: str, margin: str) -> tuple[int, int, int] | None:
+    """이미지 페이지 크기와 여백을 픽셀 단위로 반환합니다."""
+
     if page_size == "fit":
         return None
+    # ilovepdf 와 동일한 폭(150 DPI 근사) 기준으로 다양한 페이지 크기를 지원합니다.
     sizes = {
+        "a3": (1654, 2339),
         "a4": (1240, 1754),
+        "a5": (874, 1240),
         "letter": (1275, 1650),
+        "legal": (1275, 2100),
     }
     width, height = sizes.get(page_size, sizes["a4"])
     if orientation == "landscape":
@@ -1895,12 +2114,103 @@ def image_pdf_geometry(page_size: str, orientation: str, margin: str) -> tuple[i
     return width, height, margins.get(margin, 0)
 
 
+# 페이지 크기 / 여백 옵션 허용값 (프런트엔드 검증에 사용).
+ALLOWED_PDF_PAGE_SIZES = {"fit", "a3", "a4", "a5", "letter", "legal"}
+ALLOWED_PDF_ORIENTATIONS = {"auto", "portrait", "landscape"}
+ALLOWED_PDF_MARGINS = {"none", "small", "large"}
+
+# 비디오 품질 옵션 (libx264/libvpx-vp9 CRF 값).
+VIDEO_CRF_BY_QUALITY = {
+    "low": 28,
+    "normal": 23,
+    "high": 18,
+}
+ALLOWED_VIDEO_QUALITIES = set(VIDEO_CRF_BY_QUALITY)
+
+# 오디오 비트레이트 옵션 (kbps).
+AUDIO_BITRATE_PRESETS = {
+    "low": 96,
+    "normal": 192,
+    "high": 320,
+}
+ALLOWED_AUDIO_BITRATES = set(AUDIO_BITRATE_PRESETS)
+
+DEFAULT_VIDEO_QUALITY = "normal"
+DEFAULT_AUDIO_BITRATE = "normal"
+DEFAULT_IMAGE_QUALITY = 85
+DEFAULT_PDF_DPI = 160
+
+
+def parse_quality(raw: str | None, default: int = 85) -> int:
+    """이미지 품질 옵션을 안전한 정수로 파싱합니다 (1-100)."""
+
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return max(1, min(100, value))
+
+
+def parse_dpi(raw: str | None, default: int = 160) -> int:
+    """DPI 옵션을 정수로 파싱합니다 (50-600)."""
+
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return max(50, min(600, value))
+
+
+def parse_audio_bitrate(raw: str | None, default_kbps: int = 192) -> int:
+    """오디오 비트레이트를 kbps 단위로 파싱합니다 (32-320).
+
+    미리 정의된 프리셋 이름(``low``/``normal``/``high``) 또는 직접 kbps 값을 받습니다.
+    """
+
+    if raw is None:
+        return default_kbps
+    preset = str(raw).lower().strip()
+    if preset in AUDIO_BITRATE_PRESETS:
+        return AUDIO_BITRATE_PRESETS[preset]
+    try:
+        value = int(preset.replace("k", ""))
+    except (TypeError, ValueError):
+        return default_kbps
+    return max(32, min(320, value))
+
+
+def parse_video_quality(raw: str | None, default: str = DEFAULT_VIDEO_QUALITY) -> str:
+    """비디오 품질 프리셋을 정규화합니다."""
+
+    if raw is None:
+        return default
+    value = str(raw).lower().strip()
+    return value if value in ALLOWED_VIDEO_QUALITIES else default
+
+
+def parse_image_quality(raw: str | None) -> int:
+    """이미지 품질을 1-100 사이 정수로 정규화합니다."""
+
+    return parse_quality(raw, default=DEFAULT_IMAGE_QUALITY)
+
+
+def parse_pdf_dpi(raw: str | None) -> int:
+    """PDF 변환 DPI 를 50-600 사이 정수로 정규화합니다."""
+
+    return parse_dpi(raw, default=DEFAULT_PDF_DPI)
+
+
 def convert_images_to_pdf(
     files: list[UploadedFile],
     output_path: Path,
     page_size: str = "fit",
     orientation: str = "auto",
     margin: str = "none",
+    quality: int = 85,
 ) -> None:
     if not files:
         raise ConversionError("PDF로 합칠 이미지를 선택하세요.")
@@ -1954,6 +2264,8 @@ def convert_images_to_pdf(
                 ")",
             ]
         )
+    # PDF 안에서 다시 JPEG로 들어가는 경우를 대비해 결과 품질을 지정합니다.
+    command.extend(["-quality", str(quality)])
     command.append(str(output_path))
     run_checked(
         command,
@@ -2211,7 +2523,13 @@ def run_checked(
     return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
-def convert_with_ffmpeg(input_path: Path, output_path: Path, target: str) -> None:
+def convert_with_ffmpeg(
+    input_path: Path,
+    output_path: Path,
+    target: str,
+    audio_bitrate_kbps: int | None = None,
+    video_quality: str | None = None,
+) -> None:
     ffmpeg = tool_path("ffmpeg")
     if not ffmpeg:
         raise ConversionError("ffmpeg가 설치되어 있지 않습니다. scripts/install-ubuntu-deps.sh를 실행하세요.")
@@ -2220,19 +2538,43 @@ def convert_with_ffmpeg(input_path: Path, output_path: Path, target: str) -> Non
     if target in AUDIO_TARGETS:
         command.extend(["-vn", "-map_metadata", "-1"])
         if target == "mp3":
-            command.extend(["-codec:a", "libmp3lame", "-q:a", "2"])
+            command.extend(["-codec:a", "libmp3lame"])
+            if audio_bitrate_kbps:
+                command.extend(["-b:a", f"{audio_bitrate_kbps}k"])
+            else:
+                command.extend(["-q:a", "2"])
         elif target == "wav":
             command.extend(["-codec:a", "pcm_s16le"])
         elif target == "flac":
             command.extend(["-codec:a", "flac"])
         elif target == "opus":
             command.extend(["-codec:a", "libopus"])
+            if audio_bitrate_kbps:
+                command.extend(["-b:a", f"{audio_bitrate_kbps}k"])
+        elif target in {"aac", "m4a"}:
+            command.extend(["-codec:a", "aac"])
+            if audio_bitrate_kbps:
+                command.extend(["-b:a", f"{audio_bitrate_kbps}k"])
+        elif target == "ogg":
+            command.extend(["-codec:a", "libvorbis"])
+            if audio_bitrate_kbps:
+                command.extend(["-b:a", f"{audio_bitrate_kbps}k"])
+        elif audio_bitrate_kbps:
+            command.extend(["-b:a", f"{audio_bitrate_kbps}k"])
     elif target == "mp4":
-        command.extend(["-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart"])
+        crf = VIDEO_CRF_BY_QUALITY.get(video_quality or "", VIDEO_CRF_BY_QUALITY["normal"])
+        command.extend(["-c:v", "libx264", "-preset", "medium", "-crf", str(crf), "-c:a", "aac", "-movflags", "+faststart"])
     elif target == "webm":
-        command.extend(["-c:v", "libvpx-vp9", "-c:a", "libopus"])
+        crf = VIDEO_CRF_BY_QUALITY.get(video_quality or "", VIDEO_CRF_BY_QUALITY["normal"])
+        command.extend(["-c:v", "libvpx-vp9", "-crf", str(crf), "-b:v", "0", "-c:a", "libopus"])
     elif target == "gif":
         command.extend(["-vf", "fps=12,scale=960:-1:flags=lanczos"])
+    elif target == "mkv":
+        crf = VIDEO_CRF_BY_QUALITY.get(video_quality or "", VIDEO_CRF_BY_QUALITY["normal"])
+        command.extend(["-c:v", "libx264", "-crf", str(crf), "-c:a", "aac"])
+    elif target == "mov":
+        crf = VIDEO_CRF_BY_QUALITY.get(video_quality or "", VIDEO_CRF_BY_QUALITY["normal"])
+        command.extend(["-c:v", "libx264", "-crf", str(crf), "-c:a", "aac", "-movflags", "+faststart"])
     command.append(str(output_path))
     run_checked(
         command,
@@ -2242,7 +2584,12 @@ def convert_with_ffmpeg(input_path: Path, output_path: Path, target: str) -> Non
     )
 
 
-def convert_with_imagemagick(input_path: Path, output_path: Path) -> None:
+def convert_with_imagemagick(
+    input_path: Path,
+    output_path: Path,
+    target: str,
+    quality: int = 85,
+) -> None:
     magick = tool_path("magick", "convert")
     limit_args = [
         "-limit",
@@ -2261,13 +2608,16 @@ def convert_with_imagemagick(input_path: Path, output_path: Path) -> None:
         "area",
         "128MP",
     ]
+    # JPEG/WebP/AVIF 는 품질 옵션을 받지만 무손실 포맷(PNG 등)에는 의미가 없습니다.
+    lossy_targets = {"jpg", "jpeg", "webp", "avif", "heic"}
+    quality_args = ["-quality", str(quality)] if target in lossy_targets else []
     if magick:
-        command = [magick, *limit_args, str(input_path), str(output_path)]
+        command = [magick, *limit_args, str(input_path), *quality_args, str(output_path)]
     else:
         convert = tool_path("convert")
         if not convert:
             raise ConversionError("ImageMagick이 설치되어 있지 않습니다. scripts/install-ubuntu-deps.sh를 실행하세요.")
-        command = [convert, *limit_args, str(input_path), str(output_path)]
+        command = [convert, *limit_args, str(input_path), *quality_args, str(output_path)]
     run_checked(
         command,
         cwd=output_path.parent,
@@ -2276,13 +2626,13 @@ def convert_with_imagemagick(input_path: Path, output_path: Path) -> None:
     )
 
 
-def convert_pdf_to_image(input_path: Path, output_path: Path, target: str) -> None:
+def convert_pdf_to_image(input_path: Path, output_path: Path, target: str, dpi: int = 160) -> None:
     pdftoppm = tool_path("pdftoppm")
     if not pdftoppm:
         raise ConversionError("poppler-utils가 설치되어 있지 않습니다. scripts/install-ubuntu-deps.sh를 실행하세요.")
 
     output_prefix = output_path.with_suffix("")
-    command = [pdftoppm, "-singlefile", "-r", "160"]
+    command = [pdftoppm, "-singlefile", "-r", str(dpi)]
     command.append("-jpeg" if target in {"jpg", "jpeg"} else "-png")
     command.extend([str(input_path), str(output_prefix)])
     run_checked(
@@ -2407,7 +2757,18 @@ def convert_with_calibre(input_path: Path, output_path: Path) -> None:
         remove_tree(profile_dir)
 
 
-def convert_file(input_path: Path, original_name: str, target: str, job_output_dir: Path) -> Path:
+def convert_file(
+    input_path: Path,
+    original_name: str,
+    target: str,
+    job_output_dir: Path,
+    *,
+    image_quality: int = DEFAULT_IMAGE_QUALITY,
+    audio_bitrate_kbps: int | None = None,
+    video_quality: str = DEFAULT_VIDEO_QUALITY,
+    pdf_dpi: int = DEFAULT_PDF_DPI,
+    zip_level: str = DEFAULT_ZIP_LEVEL,
+) -> Path:
     source_ext = input_path.suffix.lower().lstrip(".")
     target = target.lower().lstrip(".")
     if source_ext not in ALLOWED_INPUT_EXTS:
@@ -2422,7 +2783,7 @@ def convert_file(input_path: Path, original_name: str, target: str, job_output_d
     output_path = job_output_dir / output_name
 
     if target == "zip":
-        zip_single_file(input_path, output_path, original_name)
+        zip_single_file(input_path, output_path, original_name, level=zip_level)
     elif source_ext == "csv" and target == "json":
         convert_csv_to_json(input_path, output_path)
     elif source_ext == "tsv" and target == "json":
@@ -2452,13 +2813,19 @@ def convert_file(input_path: Path, original_name: str, target: str, job_output_d
     elif target == "pdf" and source_ext in TEXT_EXTS:
         convert_text_to_pdf(input_path, output_path, original_name)
     elif target in AUDIO_TARGETS or (source_ext in VIDEO_EXTS and target in VIDEO_TARGETS):
-        convert_with_ffmpeg(input_path, output_path, target)
+        convert_with_ffmpeg(
+            input_path,
+            output_path,
+            target,
+            audio_bitrate_kbps=audio_bitrate_kbps,
+            video_quality=video_quality,
+        )
     elif source_ext == "pdf" and target in PDF_IMAGE_TARGETS:
-        convert_pdf_to_image(input_path, output_path, target)
+        convert_pdf_to_image(input_path, output_path, target, dpi=pdf_dpi)
     elif source_ext == "pdf" and target == "txt":
         convert_pdf_to_text(input_path, output_path)
     elif source_ext in IMAGE_EXTS:
-        convert_with_imagemagick(input_path, output_path)
+        convert_with_imagemagick(input_path, output_path, target=target, quality=image_quality)
     elif target == "pdf" and source_ext in DOCUMENT_EXTS:
         convert_with_libreoffice(input_path, output_path, target)
     else:
@@ -2694,14 +3061,10 @@ class FileTransHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            form = cgi.FieldStorage(
+            form = MultipartForm(
                 fp=self.rfile,
-                headers=self.headers,
-                environ={
-                    "REQUEST_METHOD": "POST",
-                    "CONTENT_TYPE": self.headers.get("Content-Type", ""),
-                    "CONTENT_LENGTH": str(content_length),
-                },
+                content_type=self.headers.get("Content-Type", ""),
+                content_length=content_length,
             )
         except (TimeoutError, socket.timeout, OSError):
             self.send_error_json("요청 본문을 읽는 시간이 초과되었습니다.", HTTPStatus.REQUEST_TIMEOUT)
