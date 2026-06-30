@@ -1,4 +1,4 @@
-.PHONY: run run-docker-worker check smoke-test build-tools build-worker install-deps clean
+.PHONY: run run-docker-worker check security-audit smoke-test build-tools build-worker install-deps clean
 
 HOST ?= 127.0.0.1
 PORT ?= 8000
@@ -12,7 +12,12 @@ run-docker-worker:
 
 check:
 	python3 -m py_compile server.py
+	bash -n scripts/build-toolchain.sh scripts/install-ubuntu-deps.sh scripts/smoke-test.sh
 	python3 -m unittest discover -s tests
+	python3 scripts/security-audit.py
+
+security-audit:
+	python3 scripts/security-audit.py
 
 smoke-test:
 	bash scripts/smoke-test.sh

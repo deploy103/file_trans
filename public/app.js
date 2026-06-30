@@ -66,23 +66,12 @@ function toolLabel(name) {
     poppler: "Poppler",
     pandoc: "Pandoc",
     calibre: "Calibre",
-    "g++": "C++",
-    java: "Java",
-    rust: "Rust",
-    csharp: "C#",
-    cpp_probe: "C++ helper",
-    rust_probe: "Rust helper",
-    java_probe: "Java helper",
-    csharp_probe: "C# helper",
   }[name] || name;
 }
 
 function renderTools() {
   toolStatus.replaceChildren();
-  const tools = {
-    ...(state.capabilities?.tools || {}),
-    ...(state.capabilities?.helpers || {}),
-  };
+  const tools = state.capabilities?.tools || {};
   for (const [name, path] of Object.entries(tools)) {
     const badge = document.createElement("span");
     badge.className = `badge ${path ? "ready" : "missing"}`;

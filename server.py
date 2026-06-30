@@ -39,13 +39,14 @@ PUBLIC_DIR = ROOT / "public"
 DATA_DIR = ROOT / "data"
 UPLOAD_DIR = DATA_DIR / "uploads"
 OUTPUT_DIR = DATA_DIR / "outputs"
-BUILD_DIR = ROOT / "build"
+RUNTIME_HOME_DIR = DATA_DIR / "runtime-home"
 IMAGEMAGICK_POLICY_DIR = ROOT / "config" / "imagemagick"
 USE_DOCKER_WORKER = os.environ.get("FILE_TRANS_USE_DOCKER", "").lower() in {"1", "true", "yes", "on"}
 CONVERT_WORKER_IMAGE = os.environ.get("FILE_TRANS_WORKER_IMAGE", "file-trans-convert-worker:latest")
 MAX_UPLOAD_BYTES = int(os.environ.get("FILE_TRANS_MAX_UPLOAD", str(100 * 1024 * 1024)))
 MAX_CONVERSION_SECONDS = int(os.environ.get("FILE_TRANS_CONVERT_TIMEOUT", "60"))
 RESULT_TTL_SECONDS = int(os.environ.get("FILE_TRANS_RESULT_TTL", str(24 * 60 * 60)))
+CLEANUP_INTERVAL_SECONDS = int(os.environ.get("FILE_TRANS_CLEANUP_INTERVAL", "600"))
 MAX_OUTPUT_BYTES = int(os.environ.get("FILE_TRANS_MAX_OUTPUT", str(1024 * 1024 * 1024)))
 MAX_PROCESS_MEMORY_BYTES = int(os.environ.get("FILE_TRANS_PROCESS_MEMORY", str(1024 * 1024 * 1024)))
 MAX_PROCESS_FILES = int(os.environ.get("FILE_TRANS_PROCESS_FILES", "128"))
@@ -57,10 +58,15 @@ MAX_ARCHIVE_MEMBERS = int(os.environ.get("FILE_TRANS_MAX_ARCHIVE_MEMBERS", "2000
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = int(
     os.environ.get("FILE_TRANS_MAX_ARCHIVE_UNCOMPRESSED", str(512 * 1024 * 1024))
 )
+MAX_REFERENCE_SCAN_BYTES = int(os.environ.get("FILE_TRANS_MAX_REFERENCE_SCAN", str(20 * 1024 * 1024)))
+ENABLE_CLAMSCAN = os.environ.get("FILE_TRANS_ENABLE_CLAMSCAN", "").lower() in {"1", "true", "yes", "on"}
+CLAMSCAN_COMMAND = os.environ.get("FILE_TRANS_CLAMSCAN", "clamscan")
+CLAMSCAN_TIMEOUT_SECONDS = int(os.environ.get("FILE_TRANS_CLAMSCAN_TIMEOUT", "30"))
 RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("FILE_TRANS_RATE_WINDOW", "600"))
 RATE_LIMIT_MAX_UPLOADS = int(os.environ.get("FILE_TRANS_RATE_MAX", "30"))
 HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8000"))
+MAX_FILENAME_CHARS = int(os.environ.get("FILE_TRANS_MAX_FILENAME_CHARS", "180"))
 
 DOCUMENT_EXTS = {
     "doc",
@@ -139,6 +145,9 @@ IMAGE_EXTS = {
     "webp",
 }
 EBOOK_EXTS = {"azw3", "cbz", "chm", "djvu", "epub", "fb2", "mobi"}
+EXTERNAL_REF_TEXT_EXTS = {"html", "htm", "fb2"} | MARKUP_EXTS
+ZIP_EXTERNAL_REF_EXTS = {"docx", "pptx", "xlsx", "odt", "ods", "odp", "hwpx", "epub"}
+ZIP_REFERENCE_MEMBER_SUFFIXES = (".rels", ".xml", ".html", ".htm", ".xhtml", ".css", ".opf", ".ncx", ".svg")
 
 AUDIO_TARGETS = {"aac", "aiff", "flac", "m4a", "mp3", "ogg", "opus", "wav"}
 VIDEO_TARGETS = {"gif", "mkv", "mov", "mp4", "webm"}
@@ -217,24 +226,39 @@ class UploadRateLimiter:
 
 rate_limiter = UploadRateLimiter(RATE_LIMIT_WINDOW_SECONDS, RATE_LIMIT_MAX_UPLOADS)
 conversion_slots = threading.BoundedSemaphore(max(1, MAX_CONCURRENT_CONVERSIONS))
+cleanup_lock = threading.Lock()
+last_cleanup_at = 0.0
 
 
 def ensure_dirs() -> None:
     mkdir_private(UPLOAD_DIR)
     mkdir_private(OUTPUT_DIR)
+    mkdir_private(RUNTIME_HOME_DIR)
     purge_upload_staging()
     cleanup_expired_jobs()
 
 
 def sanitize_filename(name: str) -> str:
+    limit = max(1, MAX_FILENAME_CHARS)
     name = Path(name or "upload.bin").name
     name = re.sub(r"[^\w.\-가-힣()\[\] ]+", "_", name, flags=re.UNICODE).strip()
-    return name or "upload.bin"
+    if not name:
+        name = "upload.bin"
+    if len(name) > limit:
+        suffix = Path(name).suffix
+        if suffix and len(suffix) < limit:
+            name = f"{Path(name).stem[: limit - len(suffix)]}{suffix}"
+        else:
+            name = name[:limit]
+    return name
 
 
 def stem_for_output(original_name: str) -> str:
+    limit = max(1, MAX_FILENAME_CHARS)
     stem = Path(original_name).stem
     stem = re.sub(r"[^\w.\-가-힣()\[\] ]+", "_", stem, flags=re.UNICODE).strip()
+    if len(stem) > limit:
+        stem = stem[:limit]
     return stem or "converted"
 
 
@@ -270,21 +294,7 @@ def installed_tools() -> dict:
         "poppler": tool_path("pdftoppm", "pdftotext"),
         "pandoc": tool_path("pandoc"),
         "calibre": tool_path("ebook-convert"),
-        "g++": local_tool_path("g++"),
-        "java": local_tool_path("javac"),
-        "rust": local_tool_path("rustc"),
-        "csharp": local_tool_path("dotnet", "mcs", "csc"),
     }
-
-
-def built_helpers() -> dict:
-    helpers = {
-        "cpp_probe": BUILD_DIR / "tools" / "fileprobe-cpp",
-        "rust_probe": BUILD_DIR / "tools" / "fileprobe-rust",
-        "java_probe": BUILD_DIR / "tools" / "java" / "FileProbe.class",
-        "csharp_probe": BUILD_DIR / "tools" / "fileprobe-cs.exe",
-    }
-    return {name: str(path) if path.exists() else None for name, path in helpers.items()}
 
 
 def public_tool_status(values: dict) -> dict:
@@ -441,17 +451,22 @@ def targets_for_extension(ext: str) -> list[str]:
 def capabilities() -> dict:
     return {
         "tools": public_tool_status(installed_tools()),
-        "helpers": public_tool_status(built_helpers()),
         "operations": operations(),
         "inputFormats": sorted(ALLOWED_INPUT_EXTS),
         "targetFormats": sorted(ALLOWED_TARGET_EXTS),
         "inputFormatCount": len(ALLOWED_INPUT_EXTS),
         "targetFormatCount": len(ALLOWED_TARGET_EXTS),
+        "maxFilenameChars": MAX_FILENAME_CHARS,
         "maxUploadBytes": MAX_UPLOAD_BYTES,
         "maxConversionSeconds": MAX_CONVERSION_SECONDS,
         "maxConcurrentConversions": max(1, MAX_CONCURRENT_CONVERSIONS),
         "requestTimeoutSeconds": REQUEST_TIMEOUT_SECONDS,
         "maxDataRecords": MAX_DATA_RECORDS,
+        "cleanupIntervalSeconds": CLEANUP_INTERVAL_SECONDS,
+        "maxReferenceScanBytes": MAX_REFERENCE_SCAN_BYTES,
+        "malwareScanEnabled": ENABLE_CLAMSCAN,
+        "malwareScanAvailable": bool(local_tool_path(CLAMSCAN_COMMAND)),
+        "malwareScanTimeoutSeconds": CLAMSCAN_TIMEOUT_SECONDS,
         "resultTtlSeconds": RESULT_TTL_SECONDS,
     }
 
@@ -507,6 +522,20 @@ def remove_tree(path: Path) -> None:
         pass
 
 
+def safe_public_file_path(request_path: str) -> Path | None:
+    if request_path in {"", "/"}:
+        request_path = "/index.html"
+    relative = Path(request_path.lstrip("/"))
+    if relative.is_absolute() or ".." in relative.parts:
+        return None
+    try:
+        file_path = (PUBLIC_DIR / relative).resolve()
+        file_path.relative_to(PUBLIC_DIR.resolve())
+    except (OSError, ValueError):
+        return None
+    return file_path
+
+
 def cleanup_expired_jobs() -> None:
     now = time.time()
     if not OUTPUT_DIR.exists():
@@ -529,6 +558,21 @@ def cleanup_expired_jobs() -> None:
         if expires_at and expires_at > now:
             continue
         remove_tree(child)
+
+
+def maybe_cleanup_expired_jobs() -> None:
+    global last_cleanup_at
+    now = time.monotonic()
+    if now - last_cleanup_at < CLEANUP_INTERVAL_SECONDS:
+        return
+    if not cleanup_lock.acquire(blocking=False):
+        return
+    try:
+        if now - last_cleanup_at >= CLEANUP_INTERVAL_SECONDS:
+            cleanup_expired_jobs()
+            last_cleanup_at = now
+    finally:
+        cleanup_lock.release()
 
 
 def purge_upload_staging() -> None:
@@ -644,6 +688,47 @@ def is_xml_like(path: Path) -> bool:
 
 def is_rtf_like(sample: bytes) -> bool:
     return sample.startswith(b"{\\rtf")
+
+
+def text_has_external_reference(text: str) -> bool:
+    text = text[:1024 * 1024].lower()
+    patterns = [
+        r"\b(?:src|href|poster|data|target|xlink:href)\s*=\s*['\"]?\s*(?:https?:|file:|ftp:|//)",
+        r"@import\s+(?:url\()?['\"]?\s*(?:https?:|file:|ftp:|//)",
+        r"url\(\s*['\"]?\s*(?:https?:|file:|ftp:|//)",
+        r"\]\(\s*(?:https?:|file:|ftp:|//)",
+        r"\\(?:includegraphics|input|include)\s*\{\s*(?:https?:|file:|ftp:|//)",
+        r"\\(?:href|url)\s*\{\s*(?:https?:|file:|ftp:|//)",
+        r"(?m)^\s*\.\.\s+(?:image|figure|include)::\s*(?:https?:|file:|ftp:|//)",
+        r"\[\[\s*(?:https?:|file:|ftp:|//)",
+        r"\bimage\(\s*['\"]\s*(?:https?:|file:|ftp:|//)",
+    ]
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
+def has_external_text_reference(path: Path) -> bool:
+    return text_has_external_reference(read_text_file(path))
+
+
+def zip_has_external_text_reference(path: Path) -> bool:
+    scanned = 0
+    try:
+        with zipfile.ZipFile(path) as archive:
+            for info in archive.infolist():
+                name = info.filename.lower()
+                if not name.endswith(ZIP_REFERENCE_MEMBER_SUFFIXES):
+                    continue
+                scanned += info.file_size
+                if scanned > MAX_REFERENCE_SCAN_BYTES:
+                    raise ConversionError("외부 참조 검사를 위한 문서 메타데이터가 너무 큽니다.")
+                text = archive.read(info).decode("utf-8", errors="ignore")
+                if text_has_external_reference(text):
+                    return True
+    except zipfile.BadZipFile as exc:
+        raise ConversionError("ZIP 기반 문서 구조가 올바르지 않습니다.") from exc
+    except (OSError, RuntimeError, zipfile.LargeZipFile) as exc:
+        raise ConversionError("ZIP 기반 문서 내부 메타데이터를 검사하지 못했습니다.") from exc
+    return False
 
 
 def is_mp4_like(sample: bytes, allowed_brands: set[str] | None = None) -> bool:
@@ -811,6 +896,10 @@ def validate_upload_file(path: Path, original_name: str, size: int, digest: str)
     detected = detect_magic(path, ext)
     if detected == "unknown":
         raise ConversionError("파일 내용이 확장자와 일치하지 않거나 지원하지 않는 형식입니다.")
+    if ext in EXTERNAL_REF_TEXT_EXTS and has_external_text_reference(path):
+        raise ConversionError("외부 리소스를 참조하는 마크업 파일은 변환할 수 없습니다.")
+    if ext in ZIP_EXTERNAL_REF_EXTS and zip_has_external_text_reference(path):
+        raise ConversionError("외부 리소스를 참조하는 문서 컨테이너는 변환할 수 없습니다.")
     return FileValidation(ext=ext, detected=detected, size=size, sha256=digest)
 
 
@@ -1510,6 +1599,44 @@ def clean_process_output(text: str) -> str:
     return text[-1200:] if text else "알 수 없는 변환 오류"
 
 
+def raise_for_clamscan_result(returncode: int, output: str) -> None:
+    if returncode == 0:
+        return
+    if returncode == 1:
+        raise ConversionError("악성 파일로 탐지되어 변환할 수 없습니다.")
+    raise ConversionError(f"악성코드 검사가 실패했습니다: {clean_process_output(output)}")
+
+
+def scan_upload_for_malware(path: Path) -> None:
+    if not ENABLE_CLAMSCAN:
+        return
+    scanner = local_tool_path(CLAMSCAN_COMMAND)
+    if not scanner:
+        raise ConversionError("ClamAV clamscan을 찾지 못해 악성코드 검사를 수행할 수 없습니다.")
+    command = [scanner, "--no-summary", "--infected", str(path)]
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            cwd=str(path.parent),
+            env=conversion_env(),
+            start_new_session=(os.name == "posix"),
+            preexec_fn=limited_preexec(CLAMSCAN_TIMEOUT_SECONDS),
+        )
+    except FileNotFoundError as exc:
+        raise ConversionError("ClamAV clamscan을 찾지 못해 악성코드 검사를 수행할 수 없습니다.") from exc
+    try:
+        stdout, stderr = process.communicate(timeout=CLAMSCAN_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as exc:
+        terminate_process_group(process)
+        process.communicate()
+        raise ConversionError("악성코드 검사 시간이 초과되었습니다.") from exc
+    raise_for_clamscan_result(process.returncode, stderr or stdout)
+
+
 def redact_log_text(text: str) -> str:
     return re.sub(r"(/download/[0-9a-f]{32}/)[A-Za-z0-9_-]{32,96}(/)", r"\1<token>\2", text)
 
@@ -1542,7 +1669,7 @@ def conversion_env(extra_env: dict | None = None) -> dict:
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "LANG": os.environ.get("LANG", "C.UTF-8"),
         "LC_ALL": os.environ.get("LC_ALL", os.environ.get("LANG", "C.UTF-8")),
-        "HOME": os.environ.get("HOME", str(DATA_DIR)),
+        "HOME": str(RUNTIME_HOME_DIR),
     }
     if IMAGEMAGICK_POLICY_DIR.exists():
         existing = os.environ.get("MAGICK_CONFIGURE_PATH")
@@ -1868,8 +1995,6 @@ def convert_with_pandoc(input_path: Path, output_path: Path, target: str) -> Non
         "-o",
         str(output_path),
     ]
-    if target == "html":
-        command.insert(2, "--embed-resources")
     run_checked(
         command,
         timeout=max(MAX_CONVERSION_SECONDS, 90),
@@ -1969,6 +2094,10 @@ def convert_file(input_path: Path, original_name: str, target: str, job_output_d
 
 class FileTransHandler(BaseHTTPRequestHandler):
     server_version = "FileTrans/0.1"
+    sys_version = ""
+
+    def version_string(self) -> str:
+        return self.server_version
 
     def setup(self) -> None:
         super().setup()
@@ -2003,6 +2132,18 @@ class FileTransHandler(BaseHTTPRequestHandler):
     def send_error_json(self, message: str, status: HTTPStatus = HTTPStatus.BAD_REQUEST) -> None:
         self.send_json({"ok": False, "error": message}, status)
 
+    def send_method_not_allowed(self, include_body: bool = True) -> None:
+        data = b"405 Method Not Allowed\n"
+        self.send_response(HTTPStatus.METHOD_NOT_ALLOWED)
+        self.send_header("Allow", "GET, POST, HEAD, OPTIONS")
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_security_headers()
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if include_body:
+            self.wfile.write(data)
+
     def send_error(self, code, message=None, explain=None) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         status = HTTPStatus(code)
         text = message or status.phrase
@@ -2015,7 +2156,39 @@ class FileTransHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def do_OPTIONS(self) -> None:
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self.send_header("Allow", "GET, POST, HEAD, OPTIONS")
+        self.send_header("Content-Length", "0")
+        self.send_security_headers()
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def do_HEAD(self) -> None:
+        if self.path.split("?", 1)[0] == "/api/capabilities":
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", "0")
+            self.send_security_headers()
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return
+        self.send_method_not_allowed(include_body=False)
+
+    def do_TRACE(self) -> None:
+        self.send_method_not_allowed()
+
+    def do_PUT(self) -> None:
+        self.send_method_not_allowed()
+
+    def do_DELETE(self) -> None:
+        self.send_method_not_allowed()
+
+    def do_PATCH(self) -> None:
+        self.send_method_not_allowed()
+
     def do_GET(self) -> None:
+        maybe_cleanup_expired_jobs()
         path = unquote(self.path.split("?", 1)[0])
         if path == "/api/capabilities":
             self.send_json({"ok": True, **capabilities()})
@@ -2026,6 +2199,7 @@ class FileTransHandler(BaseHTTPRequestHandler):
         self.serve_static(path)
 
     def do_POST(self) -> None:
+        maybe_cleanup_expired_jobs()
         path = self.path.split("?", 1)[0]
         if path == "/convert":
             self.handle_convert()
@@ -2033,13 +2207,10 @@ class FileTransHandler(BaseHTTPRequestHandler):
         self.send_error_json("알 수 없는 POST 경로입니다.", HTTPStatus.NOT_FOUND)
 
     def serve_static(self, request_path: str) -> None:
-        if request_path in {"", "/"}:
-            request_path = "/index.html"
-        relative = Path(request_path.lstrip("/"))
-        if ".." in relative.parts:
+        file_path = safe_public_file_path(request_path)
+        if file_path is None:
             self.send_error(HTTPStatus.FORBIDDEN)
             return
-        file_path = PUBLIC_DIR / relative
         if not file_path.exists() or not file_path.is_file():
             self.send_error(HTTPStatus.NOT_FOUND)
             return
@@ -2067,6 +2238,9 @@ class FileTransHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         filename = sanitize_filename(str(metadata.get("outputName", "download.bin")))
+        if len(_name_parts) != 1 or _name_parts[0] != filename:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
         file_path = OUTPUT_DIR / job_id / filename
         try:
             file_path.resolve().relative_to(OUTPUT_DIR.resolve())
@@ -2166,6 +2340,7 @@ class FileTransHandler(BaseHTTPRequestHandler):
         try:
             size, digest = copy_stream_limited(file_item.file, input_path, MAX_UPLOAD_BYTES)
             source = validate_upload_file(input_path, original_name, size, digest)
+            scan_upload_for_malware(input_path)
             if target not in targets_for_extension(source.ext):
                 raise ConversionError(f".{source.ext} 파일은 .{target} 형식으로 변환할 수 없습니다.")
             conversion_slot_acquired = conversion_slots.acquire(blocking=False)
@@ -2209,13 +2384,18 @@ class FileTransHandler(BaseHTTPRequestHandler):
         )
 
 
+class FileTransServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
 def main() -> None:
     try:
         os.umask(0o077)
     except OSError:
         pass
     ensure_dirs()
-    server = ThreadingHTTPServer((HOST, PORT), FileTransHandler)
+    server = FileTransServer((HOST, PORT), FileTransHandler)
     print(f"FileTrans running at http://{HOST}:{PORT}")
     print("Tools:", json.dumps(installed_tools(), ensure_ascii=False))
     try:

@@ -1,4 +1,5 @@
 import hashlib
+import os
 import tempfile
 import unittest
 import zipfile
@@ -8,6 +9,17 @@ import server
 
 
 class SecurityValidationTests(unittest.TestCase):
+    def test_rate_limiter_enforces_window_limit(self):
+        limiter = server.UploadRateLimiter(window_seconds=60, max_uploads=2)
+        self.assertTrue(limiter.allow("127.0.0.1"))
+        self.assertTrue(limiter.allow("127.0.0.1"))
+        self.assertFalse(limiter.allow("127.0.0.1"))
+
+    def test_rate_limiter_can_be_disabled(self):
+        limiter = server.UploadRateLimiter(window_seconds=60, max_uploads=0)
+        for _ in range(5):
+            self.assertTrue(limiter.allow("127.0.0.1"))
+
     def test_fake_png_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "fake.png"
@@ -24,6 +36,33 @@ class SecurityValidationTests(unittest.TestCase):
             with self.assertRaises(server.ConversionError):
                 server.archive_names(path)
 
+    def test_archive_member_count_limit_is_enforced(self):
+        previous = server.MAX_ARCHIVE_MEMBERS
+        server.MAX_ARCHIVE_MEMBERS = 1
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "many.docx"
+                with zipfile.ZipFile(path, "w") as archive:
+                    archive.writestr("word/document.xml", "<document/>")
+                    archive.writestr("word/extra.xml", "<extra/>")
+                with self.assertRaises(server.ConversionError):
+                    server.archive_names(path)
+        finally:
+            server.MAX_ARCHIVE_MEMBERS = previous
+
+    def test_archive_uncompressed_size_limit_is_enforced(self):
+        previous = server.MAX_ARCHIVE_UNCOMPRESSED_BYTES
+        server.MAX_ARCHIVE_UNCOMPRESSED_BYTES = 1
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "large.docx"
+                with zipfile.ZipFile(path, "w") as archive:
+                    archive.writestr("word/document.xml", "xx")
+                with self.assertRaises(server.ConversionError):
+                    server.archive_names(path)
+        finally:
+            server.MAX_ARCHIVE_UNCOMPRESSED_BYTES = previous
+
     def test_docx_zip_structure_is_detected(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "sample.docx"
@@ -33,6 +72,49 @@ class SecurityValidationTests(unittest.TestCase):
             data = path.read_bytes()
             result = server.validate_upload_file(path, "sample.docx", len(data), hashlib.sha256(data).hexdigest())
             self.assertEqual(result.detected, "docx")
+
+    def test_docx_external_relationship_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "remote.docx"
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr("[Content_Types].xml", "<Types/>")
+                archive.writestr("word/document.xml", "<document/>")
+                archive.writestr(
+                    "word/_rels/document.xml.rels",
+                    '<Relationship Target="http://169.254.169.254/latest/meta-data/" TargetMode="External"/>',
+                )
+            data = path.read_bytes()
+            with self.assertRaises(server.ConversionError):
+                server.validate_upload_file(path, "remote.docx", len(data), hashlib.sha256(data).hexdigest())
+
+    def test_html_external_reference_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "remote.html"
+            text = '<!doctype html><img src="http://169.254.169.254/latest/meta-data/">'
+            data = text.encode("utf-8")
+            path.write_bytes(data)
+            with self.assertRaises(server.ConversionError):
+                server.validate_upload_file(path, "remote.html", len(data), hashlib.sha256(data).hexdigest())
+
+    def test_markdown_external_reference_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "remote.md"
+            text = "![x](file:///etc/passwd)\n"
+            data = text.encode("utf-8")
+            path.write_bytes(data)
+            with self.assertRaises(server.ConversionError):
+                server.validate_upload_file(path, "remote.md", len(data), hashlib.sha256(data).hexdigest())
+
+    def test_markup_external_reference_patterns(self):
+        samples = [
+            ".. image:: http://169.254.169.254/latest/meta-data/\n",
+            "[[file:///etc/passwd]]\n",
+            "\\href{https://example.test/file}{x}",
+            'image("https://example.test/file")',
+        ]
+        for sample in samples:
+            with self.subTest(sample=sample):
+                self.assertTrue(server.text_has_external_reference(sample))
 
     def test_ndjson_to_csv(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -70,9 +152,41 @@ class SecurityValidationTests(unittest.TestCase):
         capabilities = server.capabilities()
         self.assertGreaterEqual(capabilities["inputFormatCount"], 40)
         self.assertGreaterEqual(capabilities["targetFormatCount"], 20)
+        self.assertGreaterEqual(capabilities["maxFilenameChars"], 1)
         self.assertGreaterEqual(capabilities["maxConcurrentConversions"], 1)
         self.assertGreaterEqual(capabilities["requestTimeoutSeconds"], 1)
         self.assertGreaterEqual(capabilities["maxDataRecords"], 1)
+        self.assertGreaterEqual(capabilities["cleanupIntervalSeconds"], 1)
+        self.assertGreaterEqual(capabilities["maxReferenceScanBytes"], 1)
+        self.assertIn("malwareScanEnabled", capabilities)
+        self.assertIn("malwareScanAvailable", capabilities)
+        self.assertGreaterEqual(capabilities["malwareScanTimeoutSeconds"], 1)
+
+    def test_compilers_are_not_exposed_as_conversion_tools(self):
+        capabilities = server.capabilities()
+        exposed_tools = set(capabilities["tools"])
+        self.assertFalse(exposed_tools & {"g++", "java", "rust", "csharp"})
+        self.assertNotIn("helpers", capabilities)
+
+    def test_http_server_uses_restart_friendly_defaults(self):
+        self.assertTrue(server.FileTransServer.daemon_threads)
+        self.assertTrue(server.FileTransServer.allow_reuse_address)
+
+    def test_clamscan_infected_result_is_rejected(self):
+        with self.assertRaises(server.ConversionError):
+            server.raise_for_clamscan_result(1, "Eicar-Test-Signature FOUND")
+
+    def test_clamscan_engine_error_is_sanitized(self):
+        with self.assertRaisesRegex(server.ConversionError, "악성코드 검사가 실패했습니다"):
+            server.raise_for_clamscan_result(2, "failed\x00with\nerror")
+
+    def test_clamscan_disabled_is_noop(self):
+        previous = server.ENABLE_CLAMSCAN
+        server.ENABLE_CLAMSCAN = False
+        try:
+            server.scan_upload_for_malware(Path("does-not-need-to-exist"))
+        finally:
+            server.ENABLE_CLAMSCAN = previous
 
     def test_download_tokens_are_redacted_from_logs(self):
         text = (
@@ -83,6 +197,27 @@ class SecurityValidationTests(unittest.TestCase):
         self.assertIn("/download/0123456789abcdef0123456789abcdef/<token>/file.txt", redacted)
         self.assertNotIn("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN0123456789_a", redacted)
 
+    def test_filename_is_sanitized_and_limited(self):
+        previous = server.MAX_FILENAME_CHARS
+        server.MAX_FILENAME_CHARS = 16
+        try:
+            name = server.sanitize_filename("../bad<script>" + ("a" * 40) + ".txt")
+            self.assertLessEqual(len(name), 16)
+            self.assertTrue(name.endswith(".txt"))
+            self.assertNotIn("<", name)
+            self.assertNotIn(">", name)
+        finally:
+            server.MAX_FILENAME_CHARS = previous
+
+    def test_tiny_filename_limit_is_still_enforced(self):
+        previous = server.MAX_FILENAME_CHARS
+        server.MAX_FILENAME_CHARS = 3
+        try:
+            name = server.sanitize_filename("abcdef.txt")
+            self.assertLessEqual(len(name), 3)
+        finally:
+            server.MAX_FILENAME_CHARS = previous
+
     def test_download_metadata_does_not_store_original_name(self):
         with tempfile.TemporaryDirectory() as tmp:
             output_path = Path(tmp) / "secret-contract.txt"
@@ -91,6 +226,60 @@ class SecurityValidationTests(unittest.TestCase):
             metadata = server.create_download_metadata("0" * 32, output_path, source)
             self.assertNotIn("originalName", metadata)
             self.assertEqual(metadata["outputName"], "secret-contract.txt")
+            self.assertEqual(metadata["outputSize"], len("result"))
+            self.assertEqual(metadata["outputSha256"], hashlib.sha256(b"result").hexdigest())
+
+    def test_cleanup_removes_expired_output_jobs(self):
+        previous_output_dir = server.OUTPUT_DIR
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                output_dir = Path(tmp) / "outputs"
+                job_dir = output_dir / ("a" * 32)
+                job_dir.mkdir(parents=True)
+                (job_dir / "result.txt").write_text("old", encoding="utf-8")
+                server.write_json(job_dir / ".job.json", {"expiresAt": 0})
+                server.OUTPUT_DIR = output_dir
+                server.cleanup_expired_jobs()
+                self.assertFalse(job_dir.exists())
+        finally:
+            server.OUTPUT_DIR = previous_output_dir
+
+    def test_maybe_cleanup_removes_expired_output_jobs(self):
+        previous_output_dir = server.OUTPUT_DIR
+        previous_last_cleanup = server.last_cleanup_at
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                output_dir = Path(tmp) / "outputs"
+                job_dir = output_dir / ("b" * 32)
+                job_dir.mkdir(parents=True)
+                (job_dir / "result.txt").write_text("old", encoding="utf-8")
+                server.write_json(job_dir / ".job.json", {"expiresAt": 0})
+                server.OUTPUT_DIR = output_dir
+                server.last_cleanup_at = 0
+                server.maybe_cleanup_expired_jobs()
+                self.assertFalse(job_dir.exists())
+        finally:
+            server.OUTPUT_DIR = previous_output_dir
+            server.last_cleanup_at = previous_last_cleanup
+
+    def test_static_symlink_escape_is_rejected(self):
+        previous_public_dir = server.PUBLIC_DIR
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                public_dir = root / "public"
+                public_dir.mkdir()
+                secret_path = root / "secret.txt"
+                secret_path.write_text("secret", encoding="utf-8")
+                link_path = public_dir / "secret.txt"
+                try:
+                    os.symlink(secret_path, link_path)
+                except (OSError, NotImplementedError) as exc:
+                    self.skipTest(f"symlink unavailable: {exc}")
+                server.PUBLIC_DIR = public_dir
+                self.assertIsNone(server.safe_public_file_path("/secret.txt"))
+        finally:
+            server.PUBLIC_DIR = previous_public_dir
 
 
 if __name__ == "__main__":

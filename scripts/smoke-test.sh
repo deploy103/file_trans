@@ -3,7 +3,19 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HOST="${HOST:-127.0.0.1}"
-PORT="${PORT:-8765}"
+if [[ -z "${PORT:-}" ]]; then
+  PORT="$(
+    python3 - <<'PY'
+import os
+import socket
+
+host = os.environ.get("HOST", "127.0.0.1")
+with socket.socket() as sock:
+    sock.bind((host, 0))
+    print(sock.getsockname()[1])
+PY
+  )"
+fi
 BASE_URL="http://${HOST}:${PORT}"
 LOG_FILE="$(mktemp /tmp/file-trans-smoke.XXXXXX.log)"
 TMP_DIR="$(mktemp -d /tmp/file-trans-smoke.XXXXXX)"
@@ -36,10 +48,28 @@ import sys
 data = json.load(sys.stdin)
 assert data["ok"] is True
 assert isinstance(data["tools"]["ffmpeg"], bool)
+assert "helpers" not in data
+assert not ({"g++", "java", "rust", "csharp"} & set(data["tools"]))
+assert isinstance(data["malwareScanEnabled"], bool)
+assert isinstance(data["malwareScanAvailable"], bool)
 assert data["inputFormatCount"] >= 40
 assert data["maxUploadBytes"] > 0
 assert data["maxConversionSeconds"] > 0
+assert data["maxReferenceScanBytes"] > 0
 '
+
+curl -fsS -D "${TMP_DIR}/headers.txt" "${BASE_URL}/" -o "${TMP_DIR}/index.html"
+grep -qi '^Server: FileTrans/' "${TMP_DIR}/headers.txt"
+if grep -qi '^Server: .*Python' "${TMP_DIR}/headers.txt"; then
+  echo "Server header leaks Python version" >&2
+  exit 1
+fi
+TRACE_STATUS="$(curl -sS -o "${TMP_DIR}/trace.txt" -w '%{http_code}' -X TRACE "${BASE_URL}/")"
+[[ "${TRACE_STATUS}" == "405" ]]
+PUT_STATUS="$(curl -sS -o "${TMP_DIR}/put.txt" -w '%{http_code}' -X PUT "${BASE_URL}/")"
+[[ "${PUT_STATUS}" == "405" ]]
+HEAD_STATUS="$(curl -fsS -o /dev/null -w '%{http_code}' -I "${BASE_URL}/api/capabilities")"
+[[ "${HEAD_STATUS}" == "200" ]]
 
 CSV_FILE="${TMP_DIR}/scores.csv"
 printf 'name,score\nkim,10\nlee,20\n' >"${CSV_FILE}"
@@ -54,6 +84,9 @@ printf '%s' "${DOWNLOAD_URL}" | grep -Eq '^/download/[0-9a-f]{32}/[A-Za-z0-9_-]{
 BAD_DOWNLOAD_URL="$(printf '%s' "${DOWNLOAD_URL}" | sed -E 's#/download/([0-9a-f]{32})/[^/]+/#/download/\\1/not-a-valid-token/#')"
 BAD_DOWNLOAD_STATUS="$(curl -sS -o "${TMP_DIR}/bad-download.txt" -w '%{http_code}' "${BASE_URL}${BAD_DOWNLOAD_URL}")"
 [[ "${BAD_DOWNLOAD_STATUS}" == "404" ]]
+WRONG_NAME_URL="$(printf '%s' "${DOWNLOAD_URL}" | sed -E 's#/[^/]+$#/wrong-name.json#')"
+WRONG_NAME_STATUS="$(curl -sS -o "${TMP_DIR}/wrong-name.txt" -w '%{http_code}' "${BASE_URL}${WRONG_NAME_URL}")"
+[[ "${WRONG_NAME_STATUS}" == "404" ]]
 curl -fsS "${BASE_URL}${DOWNLOAD_URL}" -o "${TMP_DIR}/scores.json"
 grep -q '"name": "kim"' "${TMP_DIR}/scores.json"
 
@@ -104,6 +137,17 @@ BAD_STATUS="$(
 )"
 [[ "${BAD_STATUS}" == "400" ]]
 grep -q '파일 내용이 확장자와 일치하지 않거나 지원하지 않는 형식입니다' "${TMP_DIR}/bad-response.json"
+
+REMOTE_MD_FILE="${TMP_DIR}/remote.md"
+printf '![x](http://169.254.169.254/latest/meta-data/)\n' >"${REMOTE_MD_FILE}"
+REMOTE_MD_STATUS="$(
+  curl -sS -o "${TMP_DIR}/remote-md-response.json" -w '%{http_code}' \
+    -F "file=@${REMOTE_MD_FILE};filename=remote.md" \
+    -F "target=html" \
+    "${BASE_URL}/convert"
+)"
+[[ "${REMOTE_MD_STATUS}" == "400" ]]
+grep -q '외부 리소스를 참조하는 마크업 파일은 변환할 수 없습니다' "${TMP_DIR}/remote-md-response.json"
 
 EXE_FILE="${TMP_DIR}/tool.exe"
 printf 'MZ fake\n' >"${EXE_FILE}"

@@ -19,8 +19,12 @@ RUN apt-get update \
       python3 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /input /work /tmp /var/tmp \
+RUN groupadd --system --gid 10001 filetrans \
+    && useradd --system --uid 10001 --gid filetrans --home-dir /tmp --shell /usr/sbin/nologin filetrans \
+    && mkdir -p /input /work /tmp /var/tmp \
     && chmod 1777 /tmp /var/tmp \
-    && chmod 755 /input /work
+    && chmod 755 /input \
+    && chmod 1777 /work
 
 WORKDIR /work
+USER 10001:10001

@@ -11,9 +11,4 @@ sudo apt-get install -y \
   poppler-utils \
   pandoc \
   calibre \
-  fonts-nanum \
-  g++ \
-  default-jdk \
-  rustc \
-  cargo \
-  mono-devel
+  fonts-nanum
