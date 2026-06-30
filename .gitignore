@@ -1,0 +1,27 @@
+data/
+build/
+__pycache__/
+*.pyc
+
+# Local planning and private notes
+DEVLOG.md
+개발일지.md
+요구사항
+
+# Deployment and server-local secrets
+deploy/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secrets/
+private/
+
+# Runtime logs and temporary files
+*.log
+tmp/
+temp/

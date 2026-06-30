@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>File Trans</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="app-shell">
+    <section class="workspace">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">File Trans</p>
+          <h1>파일 변환</h1>
+        </div>
+        <div class="tool-status" id="toolStatus" aria-label="변환 엔진 상태"></div>
+      </header>
+
+      <form id="convertForm" class="converter" enctype="multipart/form-data">
+        <label class="dropzone" id="dropzone">
+          <input id="fileInput" name="file" type="file">
+          <span class="drop-icon" aria-hidden="true"></span>
+          <span class="drop-title" id="fileTitle">파일 선택</span>
+          <span class="drop-meta" id="fileMeta">최대 512MB</span>
+        </label>
+
+        <div class="controls">
+          <label class="field">
+            <span>출력 형식</span>
+            <select id="targetSelect" name="target" disabled>
+              <option value="">파일을 먼저 선택하세요</option>
+            </select>
+          </label>
+          <button class="primary" id="convertButton" type="submit" disabled>
+            변환
+          </button>
+        </div>
+      </form>
+
+      <section class="result-panel" id="resultPanel" hidden>
+        <div>
+          <p class="result-title" id="resultTitle"></p>
+          <p class="result-meta" id="resultMeta"></p>
+        </div>
+        <a class="download" id="downloadLink" href="#" download>다운로드</a>
+      </section>
+
+      <section class="operation-panel">
+        <div class="panel-heading">
+          <h2>지원 변환</h2>
+          <button class="ghost" id="refreshButton" type="button">새로고침</button>
+        </div>
+        <div class="operation-grid" id="operationGrid"></div>
+      </section>
+    </section>
+  </main>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>
