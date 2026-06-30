@@ -9,6 +9,7 @@ import re
 import secrets
 import signal
 import shutil
+import socket
 import struct
 import subprocess
 import threading
@@ -50,6 +51,7 @@ MAX_PROCESS_MEMORY_BYTES = int(os.environ.get("FILE_TRANS_PROCESS_MEMORY", str(1
 MAX_PROCESS_FILES = int(os.environ.get("FILE_TRANS_PROCESS_FILES", "128"))
 MAX_PROCESS_COUNT = int(os.environ.get("FILE_TRANS_PROCESS_COUNT", "96"))
 MAX_CONCURRENT_CONVERSIONS = int(os.environ.get("FILE_TRANS_MAX_CONCURRENT", "2"))
+REQUEST_TIMEOUT_SECONDS = int(os.environ.get("FILE_TRANS_REQUEST_TIMEOUT", "30"))
 MAX_ARCHIVE_MEMBERS = int(os.environ.get("FILE_TRANS_MAX_ARCHIVE_MEMBERS", "2000"))
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = int(
     os.environ.get("FILE_TRANS_MAX_ARCHIVE_UNCOMPRESSED", str(512 * 1024 * 1024))
@@ -447,6 +449,7 @@ def capabilities() -> dict:
         "maxUploadBytes": MAX_UPLOAD_BYTES,
         "maxConversionSeconds": MAX_CONVERSION_SECONDS,
         "maxConcurrentConversions": max(1, MAX_CONCURRENT_CONVERSIONS),
+        "requestTimeoutSeconds": REQUEST_TIMEOUT_SECONDS,
         "resultTtlSeconds": RESULT_TTL_SECONDS,
     }
 
@@ -1946,6 +1949,13 @@ def convert_file(input_path: Path, original_name: str, target: str, job_output_d
 class FileTransHandler(BaseHTTPRequestHandler):
     server_version = "FileTrans/0.1"
 
+    def setup(self) -> None:
+        super().setup()
+        try:
+            self.connection.settimeout(REQUEST_TIMEOUT_SECONDS)
+        except (OSError, AttributeError):
+            pass
+
     def log_message(self, fmt: str, *args) -> None:
         message = redact_log_text(clean_process_output(fmt % args))
         print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {self.client_ip()} {message}")
@@ -2088,15 +2098,19 @@ class FileTransHandler(BaseHTTPRequestHandler):
             self.send_error_json("요청이 너무 많습니다. 잠시 후 다시 시도하세요.", HTTPStatus.TOO_MANY_REQUESTS)
             return
 
-        form = cgi.FieldStorage(
-            fp=self.rfile,
-            headers=self.headers,
-            environ={
-                "REQUEST_METHOD": "POST",
-                "CONTENT_TYPE": self.headers.get("Content-Type", ""),
-                "CONTENT_LENGTH": str(content_length),
-            },
-        )
+        try:
+            form = cgi.FieldStorage(
+                fp=self.rfile,
+                headers=self.headers,
+                environ={
+                    "REQUEST_METHOD": "POST",
+                    "CONTENT_TYPE": self.headers.get("Content-Type", ""),
+                    "CONTENT_LENGTH": str(content_length),
+                },
+            )
+        except (TimeoutError, socket.timeout, OSError):
+            self.send_error_json("요청 본문을 읽는 시간이 초과되었습니다.", HTTPStatus.REQUEST_TIMEOUT)
+            return
         file_item = form["file"] if "file" in form else None
         if isinstance(file_item, list):
             file_item = file_item[0] if file_item else None
