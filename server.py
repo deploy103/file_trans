@@ -243,6 +243,8 @@ def tool_path(*names: str) -> str | None:
             return None
         if "convert" in names:
             return "convert"
+        if "magick" in names:
+            return "convert"
         if "libreoffice" in names:
             return "libreoffice"
         if "pdftoppm" in names:
@@ -1705,7 +1707,7 @@ def convert_with_ffmpeg(input_path: Path, output_path: Path, target: str) -> Non
 
 
 def convert_with_imagemagick(input_path: Path, output_path: Path) -> None:
-    magick = tool_path("magick")
+    magick = tool_path("magick", "convert")
     limit_args = [
         "-limit",
         "time",
