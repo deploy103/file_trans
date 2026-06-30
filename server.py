@@ -467,6 +467,7 @@ def read_text_file(path: Path) -> str:
 
 def write_json(path: Path, data) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    chmod_file_private(path)
 
 
 def read_json(path: Path) -> dict:
@@ -476,6 +477,13 @@ def read_json(path: Path) -> dict:
 def chmod_private(path: Path) -> None:
     try:
         path.chmod(0o700)
+    except OSError:
+        pass
+
+
+def chmod_file_private(path: Path) -> None:
+    try:
+        path.chmod(0o600)
     except OSError:
         pass
 
@@ -548,6 +556,7 @@ def copy_stream_limited(source, output_path: Path, max_bytes: int) -> tuple[int,
             handle.write(chunk)
     if total <= 0:
         raise ConversionError("빈 파일은 변환할 수 없습니다.")
+    chmod_file_private(output_path)
     return total, digest.hexdigest()
 
 
@@ -814,6 +823,7 @@ def create_download_metadata(
     output_path: Path,
     source: FileValidation,
 ) -> dict:
+    chmod_file_private(output_path)
     token = secrets.token_urlsafe(32)
     size = output_path.stat().st_size
     with output_path.open("rb") as handle:
@@ -2200,6 +2210,10 @@ class FileTransHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    try:
+        os.umask(0o077)
+    except OSError:
+        pass
     ensure_dirs()
     server = ThreadingHTTPServer((HOST, PORT), FileTransHandler)
     print(f"FileTrans running at http://{HOST}:{PORT}")
