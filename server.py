@@ -40,6 +40,8 @@ UPLOAD_DIR = DATA_DIR / "uploads"
 OUTPUT_DIR = DATA_DIR / "outputs"
 BUILD_DIR = ROOT / "build"
 IMAGEMAGICK_POLICY_DIR = ROOT / "config" / "imagemagick"
+USE_DOCKER_WORKER = os.environ.get("FILE_TRANS_USE_DOCKER", "").lower() in {"1", "true", "yes", "on"}
+CONVERT_WORKER_IMAGE = os.environ.get("FILE_TRANS_WORKER_IMAGE", "file-trans-convert-worker:latest")
 MAX_UPLOAD_BYTES = int(os.environ.get("FILE_TRANS_MAX_UPLOAD", str(100 * 1024 * 1024)))
 MAX_CONVERSION_SECONDS = int(os.environ.get("FILE_TRANS_CONVERT_TIMEOUT", "60"))
 RESULT_TTL_SECONDS = int(os.environ.get("FILE_TRANS_RESULT_TTL", str(24 * 60 * 60)))
@@ -87,6 +89,7 @@ ALLOWED_TARGET_EXTS = AUDIO_TARGETS | VIDEO_TARGETS | IMAGE_TARGETS | PDF_IMAGE_
 TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{32,96}$")
 EXT_RE = re.compile(r"^[a-z0-9]{1,12}$")
 CHUNK_SIZE = 1024 * 1024
+CONTAINER_TOOL_NAMES = {"ffmpeg", "libreoffice", "soffice", "magick", "convert", "pdftoppm"}
 
 
 class ConversionError(Exception):
@@ -144,7 +147,7 @@ def stem_for_output(original_name: str) -> str:
     return stem or "converted"
 
 
-def tool_path(*names: str) -> str | None:
+def local_tool_path(*names: str) -> str | None:
     for name in names:
         found = shutil.which(name)
         if found:
@@ -152,15 +155,29 @@ def tool_path(*names: str) -> str | None:
     return None
 
 
+def tool_path(*names: str) -> str | None:
+    if USE_DOCKER_WORKER and any(name in CONTAINER_TOOL_NAMES for name in names):
+        if not local_tool_path("docker"):
+            return None
+        if "convert" in names:
+            return "convert"
+        if "libreoffice" in names:
+            return "libreoffice"
+        if "pdftoppm" in names:
+            return "pdftoppm"
+        return names[0]
+    return local_tool_path(*names)
+
+
 def installed_tools() -> dict:
     return {
         "ffmpeg": tool_path("ffmpeg"),
         "libreoffice": tool_path("libreoffice", "soffice"),
         "imagemagick": tool_path("magick", "convert"),
-        "g++": tool_path("g++"),
-        "java": tool_path("javac"),
-        "rust": tool_path("rustc"),
-        "csharp": tool_path("dotnet", "mcs", "csc"),
+        "g++": local_tool_path("g++"),
+        "java": local_tool_path("javac"),
+        "rust": local_tool_path("rustc"),
+        "csharp": local_tool_path("dotnet", "mcs", "csc"),
     }
 
 
@@ -1191,12 +1208,123 @@ def terminate_process_group(process: subprocess.Popen) -> None:
     process.kill()
 
 
+def docker_user_spec() -> str | None:
+    if not hasattr(os, "getuid") or not hasattr(os, "getgid"):
+        return None
+    uid = os.getuid()
+    gid = os.getgid()
+    if uid == 0:
+        return None
+    return f"{uid}:{gid}"
+
+
+def translate_command_paths(command: list[str], path_map: dict[Path, str] | None) -> list[str]:
+    if not path_map:
+        return command
+    replacements = sorted(
+        ((str(path.resolve()), target) for path, target in path_map.items()),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    )
+    translated = []
+    for arg in command:
+        value = str(arg)
+        for source, target in replacements:
+            value = value.replace(source, target)
+        translated.append(value)
+    return translated
+
+
+def docker_mount_args(mounts: list[tuple[Path, str, str]]) -> list[str]:
+    args = []
+    seen_targets = set()
+    for source, target, mode in mounts:
+        if target in seen_targets:
+            continue
+        seen_targets.add(target)
+        readonly = ",readonly" if mode == "ro" else ""
+        args.extend(
+            [
+                "--mount",
+                f"type=bind,source={source.resolve()},target={target}{readonly}",
+            ]
+        )
+    return args
+
+
+def docker_wrapped_command(
+    command: list[str],
+    mounts: list[tuple[Path, str, str]],
+    path_map: dict[Path, str] | None,
+    extra_env: dict | None,
+) -> list[str]:
+    docker = local_tool_path("docker")
+    if not docker:
+        raise ConversionError("Docker worker 모드가 켜져 있지만 docker 실행 파일을 찾지 못했습니다.")
+
+    docker_command = [
+        docker,
+        "run",
+        "--rm",
+        "--pull=never",
+        "--network",
+        "none",
+        "--read-only",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges:true",
+        "--pids-limit",
+        str(MAX_PROCESS_COUNT),
+        "--memory",
+        str(MAX_PROCESS_MEMORY_BYTES),
+        "--cpus",
+        "1.0",
+        "--tmpfs",
+        " /tmp:rw,nosuid,nodev,noexec,size=256m".strip(),
+        "--tmpfs",
+        " /var/tmp:rw,nosuid,nodev,noexec,size=128m".strip(),
+        "--workdir",
+        "/work",
+    ]
+    user_spec = docker_user_spec()
+    if user_spec:
+        docker_command.extend(["--user", user_spec])
+
+    docker_command.extend(docker_mount_args(mounts))
+
+    container_env = {"HOME": "/tmp", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
+    if IMAGEMAGICK_POLICY_DIR.exists():
+        docker_command.extend(
+            [
+                "--mount",
+                f"type=bind,source={IMAGEMAGICK_POLICY_DIR.resolve()},target=/etc/file-trans-imagemagick,readonly",
+            ]
+        )
+        container_env["MAGICK_CONFIGURE_PATH"] = "/etc/file-trans-imagemagick"
+    if extra_env:
+        container_env.update({key: str(value) for key, value in extra_env.items()})
+    for key, value in container_env.items():
+        docker_command.extend(["--env", f"{key}={value}"])
+
+    docker_command.append(CONVERT_WORKER_IMAGE)
+    docker_command.extend(translate_command_paths(command, path_map))
+    return docker_command
+
+
 def run_checked(
     command: list[str],
     timeout: int = MAX_CONVERSION_SECONDS,
     cwd: Path | None = None,
     extra_env: dict | None = None,
+    docker_mounts: list[tuple[Path, str, str]] | None = None,
+    path_map: dict[Path, str] | None = None,
 ) -> subprocess.CompletedProcess:
+    use_docker = USE_DOCKER_WORKER and docker_mounts is not None
+    if use_docker:
+        command = docker_wrapped_command(command, docker_mounts, path_map, extra_env)
+        cwd = None
+        extra_env = None
     try:
         process = subprocess.Popen(
             command,
@@ -1205,9 +1333,9 @@ def run_checked(
             stdin=subprocess.DEVNULL,
             text=True,
             cwd=str(cwd) if cwd else None,
-            env=conversion_env(extra_env),
+            env=conversion_env(extra_env) if not use_docker else None,
             start_new_session=(os.name == "posix"),
-            preexec_fn=limited_preexec(timeout),
+            preexec_fn=None if use_docker else limited_preexec(timeout),
         )
     except FileNotFoundError as exc:
         raise ConversionError(f"실행 파일을 찾지 못했습니다: {command[0]}") from exc
@@ -1245,7 +1373,12 @@ def convert_with_ffmpeg(input_path: Path, output_path: Path, target: str) -> Non
     elif target == "gif":
         command.extend(["-vf", "fps=12,scale=960:-1:flags=lanczos"])
     command.append(str(output_path))
-    run_checked(command, cwd=output_path.parent)
+    run_checked(
+        command,
+        cwd=output_path.parent,
+        docker_mounts=[(input_path.parent, "/input", "ro"), (output_path.parent, "/work", "rw")],
+        path_map={input_path: f"/input/{input_path.name}", output_path: f"/work/{output_path.name}"},
+    )
 
 
 def convert_with_imagemagick(input_path: Path, output_path: Path) -> None:
@@ -1274,7 +1407,12 @@ def convert_with_imagemagick(input_path: Path, output_path: Path) -> None:
         if not convert:
             raise ConversionError("ImageMagick이 설치되어 있지 않습니다. scripts/install-ubuntu-deps.sh를 실행하세요.")
         command = [convert, *limit_args, str(input_path), str(output_path)]
-    run_checked(command, cwd=output_path.parent)
+    run_checked(
+        command,
+        cwd=output_path.parent,
+        docker_mounts=[(input_path.parent, "/input", "ro"), (output_path.parent, "/work", "rw")],
+        path_map={input_path: f"/input/{input_path.name}", output_path: f"/work/{output_path.name}"},
+    )
 
 
 def convert_pdf_to_image(input_path: Path, output_path: Path, target: str) -> None:
@@ -1286,7 +1424,16 @@ def convert_pdf_to_image(input_path: Path, output_path: Path, target: str) -> No
     command = [pdftoppm, "-singlefile", "-r", "160"]
     command.append("-jpeg" if target in {"jpg", "jpeg"} else "-png")
     command.extend([str(input_path), str(output_prefix)])
-    run_checked(command, cwd=output_path.parent)
+    run_checked(
+        command,
+        cwd=output_path.parent,
+        docker_mounts=[(input_path.parent, "/input", "ro"), (output_path.parent, "/work", "rw")],
+        path_map={
+            input_path: f"/input/{input_path.name}",
+            output_prefix: f"/work/{output_prefix.name}",
+            output_path: f"/work/{output_path.name}",
+        },
+    )
 
     generated = output_prefix.with_suffix(".jpg" if target in {"jpg", "jpeg"} else ".png")
     if generated != output_path:
@@ -1316,7 +1463,14 @@ def convert_with_libreoffice(input_path: Path, output_path: Path, target: str) -
         str(input_path),
     ]
     try:
-        run_checked(command, timeout=max(MAX_CONVERSION_SECONDS, 90), cwd=outdir, extra_env={"HOME": str(profile_dir)})
+        run_checked(
+            command,
+            timeout=max(MAX_CONVERSION_SECONDS, 90),
+            cwd=outdir,
+            extra_env={"HOME": str(profile_dir)},
+            docker_mounts=[(input_path.parent, "/input", "ro"), (outdir, "/work", "rw")],
+            path_map={input_path: f"/input/{input_path.name}", outdir: "/work", profile_dir: "/work/.libreoffice-profile"},
+        )
         expected = outdir / f"{input_path.stem}.{target}"
         if not expected.exists():
             matches = sorted(outdir.glob(f"*.{target}"), key=lambda item: item.stat().st_mtime, reverse=True)

@@ -1,0 +1,16 @@
+.git/
+data/
+build/
+__pycache__/
+*.pyc
+*.log
+tmp/
+temp/
+deploy/
+secrets/
+private/
+.env
+.env.*
+DEVLOG.md
+개발일지.md
+요구사항
