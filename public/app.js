@@ -30,6 +30,13 @@ function formatBytes(value) {
   return `${size.toFixed(index === 0 ? 0 : 1)}${units[index]}`;
 }
 
+function formatExpiry(seconds) {
+  if (!Number.isFinite(seconds)) return "";
+  const date = new Date(seconds * 1000);
+  if (Number.isNaN(date.getTime())) return "";
+  return `${date.toLocaleString()}까지`;
+}
+
 function extensionOf(file) {
   const name = file?.name || "";
   const dot = name.lastIndexOf(".");
@@ -122,6 +129,15 @@ function setFile(file) {
   fileTitle.textContent = file.name;
   fileMeta.textContent = `${formatBytes(file.size)} · .${ext || "unknown"}`;
 
+  const maxBytes = state.capabilities?.maxUploadBytes || 0;
+  if (maxBytes && file.size > maxBytes) {
+    targetSelect.innerHTML = '<option value="">용량 제한 초과</option>';
+    targetSelect.disabled = true;
+    convertButton.disabled = true;
+    fileMeta.textContent = `${formatBytes(file.size)} · 최대 ${formatBytes(maxBytes)}`;
+    return;
+  }
+
   targetSelect.replaceChildren();
   if (targets.length === 0) {
     const option = document.createElement("option");
@@ -157,10 +173,19 @@ async function convertSelectedFile(event) {
   event.preventDefault();
   const file = state.selectedFile;
   if (!file || !targetSelect.value) return;
+  const maxBytes = state.capabilities?.maxUploadBytes || 0;
+  if (maxBytes && file.size > maxBytes) {
+    resultTitle.textContent = "변환 실패";
+    resultMeta.textContent = `최대 ${formatBytes(maxBytes)}까지 업로드할 수 있습니다.`;
+    downloadLink.hidden = true;
+    resultPanel.hidden = false;
+    return;
+  }
 
   convertButton.disabled = true;
   convertButton.textContent = "변환 중";
   resultPanel.hidden = true;
+  downloadLink.hidden = true;
 
   const formData = new FormData();
   formData.append("file", file);
@@ -177,14 +202,16 @@ async function convertSelectedFile(event) {
     }
 
     resultTitle.textContent = data.outputName;
-    resultMeta.textContent = formatBytes(data.size);
+    resultMeta.textContent = [formatBytes(data.size), formatExpiry(data.expiresAt)].filter(Boolean).join(" · ");
     downloadLink.href = data.downloadUrl;
     downloadLink.download = data.outputName;
+    downloadLink.hidden = false;
     resultPanel.hidden = false;
   } catch (error) {
     resultTitle.textContent = "변환 실패";
     resultMeta.textContent = error.message;
     downloadLink.href = "#";
+    downloadLink.hidden = true;
     resultPanel.hidden = false;
   } finally {
     convertButton.textContent = "변환";
@@ -225,5 +252,6 @@ refreshButton.addEventListener("click", loadCapabilities);
 loadCapabilities().catch((error) => {
   resultTitle.textContent = "초기화 실패";
   resultMeta.textContent = error.message;
+  downloadLink.hidden = true;
   resultPanel.hidden = false;
 });

@@ -132,6 +132,7 @@ rate_limiter = UploadRateLimiter(RATE_LIMIT_WINDOW_SECONDS, RATE_LIMIT_MAX_UPLOA
 def ensure_dirs() -> None:
     mkdir_private(UPLOAD_DIR)
     mkdir_private(OUTPUT_DIR)
+    purge_upload_staging()
     cleanup_expired_jobs()
 
 
@@ -354,27 +355,36 @@ def remove_tree(path: Path) -> None:
 
 def cleanup_expired_jobs() -> None:
     now = time.time()
-    for root in (UPLOAD_DIR, OUTPUT_DIR):
-        if not root.exists():
+    if not OUTPUT_DIR.exists():
+        return
+    for child in OUTPUT_DIR.iterdir():
+        if not child.is_dir():
             continue
-        for child in root.iterdir():
-            if not child.is_dir():
-                continue
-            metadata_path = child / ".job.json"
-            expires_at = None
-            if metadata_path.exists():
-                try:
-                    expires_at = float(read_json(metadata_path).get("expiresAt", 0))
-                except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                    expires_at = 0
-            else:
-                try:
-                    expires_at = child.stat().st_mtime + RESULT_TTL_SECONDS
-                except OSError:
-                    expires_at = 0
-            if expires_at and expires_at > now:
-                continue
+        metadata_path = child / ".job.json"
+        expires_at = None
+        if metadata_path.exists():
+            try:
+                expires_at = float(read_json(metadata_path).get("expiresAt", 0))
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                expires_at = 0
+        else:
+            try:
+                expires_at = child.stat().st_mtime + RESULT_TTL_SECONDS
+            except OSError:
+                expires_at = 0
+        if expires_at and expires_at > now:
+            continue
+        remove_tree(child)
+
+
+def purge_upload_staging() -> None:
+    if not UPLOAD_DIR.exists():
+        return
+    for child in UPLOAD_DIR.iterdir():
+        if child.is_dir():
             remove_tree(child)
+        else:
+            safe_unlink(child)
 
 
 def copy_stream_limited(source, output_path: Path, max_bytes: int) -> tuple[int, str]:
