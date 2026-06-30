@@ -610,6 +610,30 @@ h1 {
   padding: 0 12px;
 }
 
+.option-grid input[type="number"] {
+  appearance: none;
+  background: var(--background);
+  border: 1px solid var(--outline);
+  border-radius: 8px;
+  color: var(--text-primary);
+  min-height: 42px;
+  padding: 0 12px;
+  width: 100%;
+}
+
+.option-grid input[type="number"]:focus,
+.option-grid select:focus {
+  border-color: var(--accent);
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.batch-options > .option-grid + .option-grid {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px dashed var(--outline);
+}
+
 .text-button {
   align-items: center;
   background: transparent;
