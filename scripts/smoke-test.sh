@@ -62,6 +62,8 @@ assert data["maxConversionSeconds"] > 0
 assert data["maxProcessMemoryBytes"] > 0
 assert data["maxProcessFiles"] > 0
 assert data["maxProcessCount"] > 0
+assert data["maxBatchFiles"] > 0
+assert data["maxBatchUploadBytes"] > 0
 assert data["maxReferenceScanBytes"] > 0
 assert data["maxArchiveMembers"] > 0
 assert data["maxArchiveUncompressedBytes"] > 0
@@ -179,6 +181,52 @@ curl -fsS "${BASE_URL}${SRT_URL}" -o "${TMP_DIR}/caption.vtt"
 grep -q '^WEBVTT' "${TMP_DIR}/caption.vtt"
 grep -q '00:00:01.000 --> 00:00:02.000' "${TMP_DIR}/caption.vtt"
 
+ZIP_A="${TMP_DIR}/zip-a.txt"
+ZIP_B="${TMP_DIR}/zip-b.txt"
+printf 'alpha\n' >"${ZIP_A}"
+printf 'beta\n' >"${ZIP_B}"
+ZIP_RESPONSE="$(
+  curl -fsS \
+    -F "file=@${ZIP_A};filename=zip-a.txt" \
+    -F "relativePath=docs/zip-a.txt" \
+    -F "file=@${ZIP_B};filename=zip-b.txt" \
+    -F "relativePath=docs/zip-b.txt" \
+    -F "target=zip" \
+    "${BASE_URL}/convert"
+)"
+ZIP_URL="$(printf '%s' "${ZIP_RESPONSE}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["downloadUrl"])')"
+curl -fsS "${BASE_URL}${ZIP_URL}" -o "${TMP_DIR}/files.zip"
+python3 - "${TMP_DIR}/files.zip" <<'PY'
+import sys
+import zipfile
+
+with zipfile.ZipFile(sys.argv[1]) as archive:
+    assert sorted(archive.namelist()) == ["docs/zip-a.txt", "docs/zip-b.txt"]
+    assert archive.read("docs/zip-a.txt") == b"alpha\n"
+PY
+
+if command -v pdfinfo >/dev/null 2>&1 && curl -fsS "${BASE_URL}/api/capabilities" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["tools"].get("imagemagick") else 1)'; then
+  IMAGE_A="${TMP_DIR}/red.ppm"
+  IMAGE_B="${TMP_DIR}/blue.ppm"
+  printf 'P3\n2 2\n255\n255 0 0 255 0 0 255 0 0 255 0 0\n' >"${IMAGE_A}"
+  printf 'P3\n2 2\n255\n0 0 255 0 0 255 0 0 255 0 0 255\n' >"${IMAGE_B}"
+  IMAGE_PDF_RESPONSE="$(
+    curl -fsS \
+      -F "file=@${IMAGE_A};filename=red.ppm" \
+      -F "relativePath=red.ppm" \
+      -F "file=@${IMAGE_B};filename=blue.ppm" \
+      -F "relativePath=blue.ppm" \
+      -F "target=pdf" \
+      -F "pdfPageSize=fit" \
+      -F "pdfOrientation=auto" \
+      -F "pdfMargin=none" \
+      "${BASE_URL}/convert"
+  )"
+  IMAGE_PDF_URL="$(printf '%s' "${IMAGE_PDF_RESPONSE}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["downloadUrl"])')"
+  curl -fsS "${BASE_URL}${IMAGE_PDF_URL}" -o "${TMP_DIR}/images.pdf"
+  pdfinfo "${TMP_DIR}/images.pdf" | grep -Eq '^Pages:[[:space:]]+2$'
+fi
+
 BAD_FILE="${TMP_DIR}/bad.png"
 printf 'not a png\n' >"${BAD_FILE}"
 BAD_STATUS="$(
@@ -203,14 +251,23 @@ grep -q '외부 리소스를 참조하는 마크업 파일은 변환할 수 없�
 
 EXE_FILE="${TMP_DIR}/tool.exe"
 printf 'MZ fake\n' >"${EXE_FILE}"
-EXE_STATUS="$(
-  curl -sS -o "${TMP_DIR}/exe-response.json" -w '%{http_code}' \
+EXE_RESPONSE="$(
+  curl -fsS \
     -F "file=@${EXE_FILE};filename=tool.exe" \
+    -F "relativePath=bin/tool.exe" \
     -F "target=zip" \
     "${BASE_URL}/convert"
 )"
-[[ "${EXE_STATUS}" == "400" ]]
-grep -q '.exe 파일은 업로드 허용 목록에 없습니다' "${TMP_DIR}/exe-response.json"
+EXE_ZIP_URL="$(printf '%s' "${EXE_RESPONSE}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["downloadUrl"])')"
+curl -fsS "${BASE_URL}${EXE_ZIP_URL}" -o "${TMP_DIR}/exe.zip"
+python3 - "${TMP_DIR}/exe.zip" <<'PY'
+import sys
+import zipfile
+
+with zipfile.ZipFile(sys.argv[1]) as archive:
+    assert archive.namelist() == ["bin/tool.exe"]
+    assert archive.read("bin/tool.exe") == b"MZ fake\n"
+PY
 
 if find "${SMOKE_DATA_DIR}/uploads" -mindepth 1 -maxdepth 2 -print -quit | grep -q .; then
   echo "smoke upload staging directory is not empty" >&2

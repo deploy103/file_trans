@@ -1,4 +1,5 @@
 import hashlib
+import io
 import os
 import stat
 import tempfile
@@ -8,6 +9,12 @@ import zipfile
 from pathlib import Path
 
 import server
+
+
+class FakeUpload:
+    def __init__(self, filename: str, data: bytes):
+        self.filename = filename
+        self.file = io.BytesIO(data)
 
 
 class SecurityValidationTests(unittest.TestCase):
@@ -190,6 +197,58 @@ class SecurityValidationTests(unittest.TestCase):
             self.assertTrue(text.startswith("WEBVTT"))
             self.assertIn("00:00:01.000 --> 00:00:02.000", text)
 
+    def test_multi_file_zip_preserves_safe_relative_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            upload_dir = root / "uploads"
+            output_path = root / "files.zip"
+            upload_dir.mkdir()
+            files = server.copy_and_validate_uploads(
+                [
+                    FakeUpload("a.txt", b"alpha\n"),
+                    FakeUpload("b.txt", b"beta\n"),
+                ],
+                ["docs/a.txt", "docs/b.txt"],
+                upload_dir,
+                "zip",
+            )
+            server.zip_uploaded_files(files, output_path)
+            with zipfile.ZipFile(output_path) as archive:
+                self.assertEqual(sorted(archive.namelist()), ["docs/a.txt", "docs/b.txt"])
+                self.assertEqual(archive.read("docs/a.txt"), b"alpha\n")
+
+    def test_zip_accepts_arbitrary_files_without_conversion_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            upload_dir = root / "uploads"
+            output_path = root / "files.zip"
+            upload_dir.mkdir()
+            files = server.copy_and_validate_uploads(
+                [
+                    FakeUpload("tool.exe", b"MZ fake executable\n"),
+                    FakeUpload("Makefile", b"all:\n\ttrue\n"),
+                ],
+                ["bin/tool.exe", "src/Makefile"],
+                upload_dir,
+                "zip",
+            )
+            self.assertEqual(files[0].validation.detected, "raw")
+            self.assertEqual(files[1].validation.ext, "file")
+            server.zip_uploaded_files(files, output_path)
+            with zipfile.ZipFile(output_path) as archive:
+                self.assertEqual(sorted(archive.namelist()), ["bin/tool.exe", "src/Makefile"])
+                self.assertEqual(archive.read("src/Makefile"), b"all:\n\ttrue\n")
+
+    def test_zip_relative_path_traversal_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(server.ConversionError):
+                server.copy_and_validate_uploads(
+                    [FakeUpload("a.txt", b"alpha\n")],
+                    ["../a.txt"],
+                    Path(tmp),
+                    "zip",
+                )
+
     def test_format_counts_cover_public_requirement(self):
         capabilities = server.capabilities()
         self.assertGreaterEqual(capabilities["inputFormatCount"], 40)
@@ -202,6 +261,8 @@ class SecurityValidationTests(unittest.TestCase):
         self.assertGreaterEqual(capabilities["maxProcessMemoryBytes"], 1)
         self.assertGreaterEqual(capabilities["maxProcessFiles"], 1)
         self.assertGreaterEqual(capabilities["maxProcessCount"], 1)
+        self.assertGreaterEqual(capabilities["maxBatchFiles"], 1)
+        self.assertGreaterEqual(capabilities["maxBatchUploadBytes"], 1)
         self.assertGreaterEqual(capabilities["maxDataRecords"], 1)
         self.assertGreaterEqual(capabilities["maxArchiveMembers"], 1)
         self.assertGreaterEqual(capabilities["maxArchiveUncompressedBytes"], 1)

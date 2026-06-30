@@ -56,7 +56,8 @@ make install-deps
 - 데이터/자막: `csv`, `tsv`, `json`, `xml`, `yaml`, `srt`, `vtt` 등
 - 오디오/영상: `mp3`, `wav`, `flac`, `mp4`, `mov`, `mkv`, `webm` 등
 - 전자책: `epub`, `mobi`, `azw3`, `fb2`, `cbz` 등
-- 압축: 선택한 파일을 `zip`으로 묶기
+- 압축: 여러 파일과 폴더를 하나의 `zip`으로 묶기
+- 묶음 변환: 여러 이미지를 순서대로 하나의 `pdf`로 합치기
 
 ## 확인
 

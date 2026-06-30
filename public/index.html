@@ -44,6 +44,7 @@
       <section id="uploadSection" class="upload-section">
         <div id="dropzone" class="dropzone" role="button" tabindex="0">
           <input id="fileInput" name="file" type="file" multiple aria-hidden="true" tabindex="-1">
+          <input id="folderInput" name="folder" type="file" multiple webkitdirectory aria-hidden="true" tabindex="-1">
           <span class="upload-icon icon-upload" aria-hidden="true"></span>
           <span id="dropTitle" class="drop-title">파일을 이곳으로 드래그하거나 클릭하여 추가하세요</span>
           <span class="drop-meta" id="dropMeta">여러 파일을 한 번에 선택하고 변환할 수 있습니다.</span>
@@ -59,6 +60,7 @@
           </div>
           <div id="actionReady" class="workspace-actions">
             <button id="addMoreButton" class="text-button" type="button">추가</button>
+            <button id="addFolderButton" class="text-button" type="button" hidden>폴더</button>
             <span class="action-divider" aria-hidden="true"></span>
             <button id="convertButton" class="primary" type="submit" disabled>
               <span class="button-icon icon-play" aria-hidden="true"></span>
@@ -74,6 +76,35 @@
               <span class="button-icon icon-download" aria-hidden="true"></span>
               전체 다운로드
             </button>
+          </div>
+        </section>
+
+        <section id="batchOptions" class="batch-options" hidden>
+          <div id="imagePdfOptions" class="option-grid" hidden>
+            <label>
+              <span>페이지</span>
+              <select id="pdfPageSize" name="pdfPageSize">
+                <option value="fit">이미지 크기</option>
+                <option value="a4">A4</option>
+                <option value="letter">Letter</option>
+              </select>
+            </label>
+            <label>
+              <span>방향</span>
+              <select id="pdfOrientation" name="pdfOrientation">
+                <option value="auto">자동</option>
+                <option value="portrait">세로</option>
+                <option value="landscape">가로</option>
+              </select>
+            </label>
+            <label>
+              <span>여백</span>
+              <select id="pdfMargin" name="pdfMargin">
+                <option value="none">없음</option>
+                <option value="small">작게</option>
+                <option value="large">크게</option>
+              </select>
+            </label>
           </div>
         </section>
 

@@ -570,6 +570,46 @@ h1 {
   display: none;
 }
 
+.batch-options {
+  background: var(--surface);
+  border: 1px solid var(--outline);
+  border-radius: 12px;
+  padding: 14px;
+}
+
+.batch-options[hidden],
+.option-grid[hidden] {
+  display: none;
+}
+
+.option-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.option-grid label {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+}
+
+.option-grid span {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.option-grid select {
+  appearance: none;
+  background: var(--background);
+  border: 1px solid var(--outline);
+  border-radius: 8px;
+  color: var(--text-primary);
+  min-height: 42px;
+  padding: 0 12px;
+}
+
 .text-button {
   align-items: center;
   background: transparent;
@@ -1109,6 +1149,10 @@ h1 {
   .workspace-actions {
     flex-wrap: wrap;
     justify-content: stretch;
+  }
+
+  .option-grid {
+    grid-template-columns: 1fr;
   }
 
   #actionReady .text-button,

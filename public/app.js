@@ -112,17 +112,24 @@ const controlSection = document.querySelector("#convertForm");
 const dropzone = document.querySelector("#dropzone");
 const subDropzone = document.querySelector("#subDropzone");
 const fileInput = document.querySelector("#fileInput");
+const folderInput = document.querySelector("#folderInput");
 const fileList = document.querySelector("#fileList");
 const fileCountBadge = document.querySelector("#fileCountBadge");
 const workspaceStatusText = document.querySelector("#workspaceStatusText");
 const actionReady = document.querySelector("#actionReady");
 const actionDone = document.querySelector("#actionDone");
 const addMoreButton = document.querySelector("#addMoreButton");
+const addFolderButton = document.querySelector("#addFolderButton");
 const convertButton = document.querySelector("#convertButton");
 const resetButton = document.querySelector("#resetButton");
 const downloadAllButton = document.querySelector("#downloadAllButton");
 const downloadZipButton = document.querySelector("#downloadZipButton");
 const toolStatus = document.querySelector("#toolStatus");
+const batchOptions = document.querySelector("#batchOptions");
+const imagePdfOptions = document.querySelector("#imagePdfOptions");
+const pdfPageSize = document.querySelector("#pdfPageSize");
+const pdfOrientation = document.querySelector("#pdfOrientation");
+const pdfMargin = document.querySelector("#pdfMargin");
 const routeBadge = document.querySelector("#routeBadge");
 const routeSubtitle = document.querySelector("#routeSubtitle");
 const dropTitle = document.querySelector("#dropTitle");
@@ -197,6 +204,29 @@ function targetsForExt(ext) {
     }
   }
   return [...targets].sort();
+}
+
+function usesBatchConversion() {
+  if (!state.preset) return false;
+  return state.preset.to === "zip" || (state.preset.from === "image" && state.preset.to === "pdf");
+}
+
+function relativePathForFile(file) {
+  return file.webkitRelativePath || file.name;
+}
+
+function selectedFileCount() {
+  return state.files.filter((item) => item.file).length;
+}
+
+function maxFileCount() {
+  return state.capabilities?.maxBatchFiles || MAX_SELECTED_FILES;
+}
+
+function batchOutputLabel() {
+  if (state.preset?.to === "zip") return "files.zip";
+  if (state.preset?.from === "image" && state.preset?.to === "pdf") return "images.pdf";
+  return `converted.${state.preset?.to || "bin"}`;
 }
 
 function toolAvailable(tool) {
@@ -293,6 +323,8 @@ function showMain() {
   state.preset = null;
   state.files = [];
   state.converting = false;
+  fileInput.value = "";
+  folderInput.value = "";
   toolPage.hidden = false;
   converterPage.hidden = true;
   navHome.classList.remove("active");
@@ -318,11 +350,19 @@ function showConverter(preset) {
 
   const extList = sourceExts(preset.from);
   fileInput.accept = preset.from === "file" ? "" : extList.map((ext) => `.${ext}`).join(",");
+  folderInput.accept = fileInput.accept;
 
   const maxBytes = state.capabilities?.maxUploadBytes || 0;
-  dropMeta.textContent = preset.from === "file"
-    ? `지원 형식 ${state.capabilities?.inputFormatCount || 0}개 이상 · 파일당 최대 ${formatBytes(maxBytes)} · 최대 ${MAX_SELECTED_FILES}개`
-    : `허용 입력: ${extList.slice(0, 8).map((ext) => `.${ext}`).join(", ")}${extList.length > 8 ? "..." : ""} · 파일당 최대 ${formatBytes(maxBytes)} · 최대 ${MAX_SELECTED_FILES}개`;
+  const maxBatchBytes = state.capabilities?.maxBatchUploadBytes || 0;
+  if (preset.to === "zip") {
+    dropMeta.textContent = `파일과 폴더를 하나의 ZIP으로 묶습니다 · 파일당 최대 ${formatBytes(maxBytes)} · 총 ${formatBytes(maxBatchBytes)}`;
+  } else if (preset.from === "image" && preset.to === "pdf") {
+    dropMeta.textContent = `여러 이미지를 순서대로 하나의 PDF로 합칩니다 · 파일당 최대 ${formatBytes(maxBytes)} · 총 ${formatBytes(maxBatchBytes)}`;
+  } else {
+    dropMeta.textContent = preset.from === "file"
+      ? `지원 형식 ${state.capabilities?.inputFormatCount || 0}개 이상 · 파일당 최대 ${formatBytes(maxBytes)} · 최대 ${MAX_SELECTED_FILES}개`
+      : `허용 입력: ${extList.slice(0, 8).map((ext) => `.${ext}`).join(", ")}${extList.length > 8 ? "..." : ""} · 파일당 최대 ${formatBytes(maxBytes)} · 최대 ${MAX_SELECTED_FILES}개`;
+  }
 
   renderWorkspace();
   if (preset.unavailable || !toolAvailable(preset)) {
@@ -341,6 +381,7 @@ function renderRoute() {
 
 function fileMatchesPreset(file, preset) {
   if (!file || !preset) return false;
+  if (preset.from === "file" && preset.to === "zip") return true;
   const ext = extensionOf(file);
   return sourceExts(preset.from).includes(ext) && targetsForExt(ext).includes(preset.to);
 }
@@ -365,13 +406,14 @@ function addInvalidFileMessage(message) {
   renderWorkspace();
 }
 
-function addFiles(files) {
+function addFiles(files, relativePaths = new Map()) {
   if (state.converting) return;
   const incoming = Array.from(files || []);
   if (!incoming.length) return;
 
-  const selectedCount = state.files.filter((item) => item.file).length;
-  const availableSlots = Math.max(0, MAX_SELECTED_FILES - selectedCount);
+  const selectedCount = selectedFileCount();
+  const maxFiles = maxFileCount();
+  const availableSlots = Math.max(0, maxFiles - selectedCount);
   const acceptedFiles = incoming.slice(0, availableSlots);
 
   for (const file of acceptedFiles) {
@@ -379,6 +421,7 @@ function addFiles(files) {
     const row = {
       id: fileRowId(),
       file,
+      relativePath: relativePaths.get(file) || relativePathForFile(file),
       status: "ready",
       progress: 0,
       result: null,
@@ -394,9 +437,10 @@ function addFiles(files) {
     state.files.push(row);
   }
   if (acceptedFiles.length < incoming.length) {
-    state.files.push(invalidFileRow(`한 작업에는 최대 ${MAX_SELECTED_FILES}개까지 추가할 수 있습니다.`));
+    state.files.push(invalidFileRow(`한 작업에는 최대 ${maxFiles}개까지 추가할 수 있습니다.`));
   }
   fileInput.value = "";
+  folderInput.value = "";
   renderWorkspace();
 }
 
@@ -416,14 +460,18 @@ function doneFiles() {
 
 function renderWorkspace() {
   const hasFiles = state.files.length > 0;
-  const selectedFileCount = state.files.filter((item) => item.file).length;
+  const currentFileCount = selectedFileCount();
   uploadSection.hidden = hasFiles;
   controlSection.hidden = !hasFiles;
-  fileCountBadge.textContent = String(selectedFileCount);
+  fileCountBadge.textContent = String(currentFileCount);
   fileList.replaceChildren();
 
   if (!hasFiles) {
     workspaceStatusText.textContent = "변환할 파일을 추가하고 시작 버튼을 눌러주세요.";
+    batchOptions.hidden = true;
+    imagePdfOptions.hidden = true;
+    addFolderButton.hidden = true;
+    convertButton.lastChild.textContent = "변환 시작";
     return;
   }
 
@@ -431,13 +479,20 @@ function renderWorkspace() {
   const anyConverting = state.files.some((item) => item.status === "converting");
   const readyCount = readyFiles().length;
   const errorCount = state.files.filter((item) => item.status === "error").length;
+  const totalBytes = state.files
+    .filter((item) => item.file)
+    .reduce((sum, item) => sum + Number(item.file.size || 0), 0);
+  const maxBatchBytes = state.capabilities?.maxBatchUploadBytes || 0;
+  const isBatch = usesBatchConversion();
 
   if (anyConverting || state.converting) {
-    workspaceStatusText.textContent = "파일을 변환하는 중입니다...";
+    workspaceStatusText.textContent = isBatch ? "묶음 결과를 생성하는 중입니다..." : "파일을 변환하는 중입니다...";
   } else if (allDone && doneFiles().length) {
     workspaceStatusText.textContent = errorCount ? "변환이 끝났고 일부 파일은 실패했습니다." : "모든 파일 변환이 완료되었습니다.";
   } else if (readyCount) {
-    workspaceStatusText.textContent = "변환할 파일을 추가하고 시작 버튼을 눌러주세요.";
+    workspaceStatusText.textContent = isBatch
+      ? `${readyCount}개 파일 · 총 ${formatBytes(totalBytes)}${maxBatchBytes ? ` / ${formatBytes(maxBatchBytes)}` : ""}`
+      : "변환할 파일을 추가하고 시작 버튼을 눌러주세요.";
   } else {
     workspaceStatusText.textContent = "변환 가능한 파일이 없습니다.";
   }
@@ -446,6 +501,13 @@ function renderWorkspace() {
   actionDone.hidden = !actionReady.hidden;
   subDropzone.hidden = state.converting || actionDone.hidden === false;
   convertButton.disabled = state.converting || readyCount === 0;
+  downloadZipButton.hidden = state.preset?.to === "zip" || doneFiles().length < 2;
+  addFolderButton.hidden = state.preset?.to !== "zip";
+  batchOptions.hidden = !isBatch || state.converting || actionDone.hidden === false;
+  imagePdfOptions.hidden = !(state.preset?.from === "image" && state.preset?.to === "pdf");
+  convertButton.lastChild.textContent = isBatch
+    ? (state.preset?.to === "zip" ? "ZIP 만들기" : "PDF로 합치기")
+    : "변환 시작";
 
   for (const item of state.files) {
     fileList.appendChild(renderFileRow(item));
@@ -459,15 +521,15 @@ function renderFileRow(item) {
 
   const ext = document.createElement("span");
   ext.className = "file-ext";
-  ext.textContent = item.file ? extensionOf(item.file) || "file" : "!";
+  ext.textContent = item.file ? extensionOf(item.file) || "file" : item.displayExt || "!";
 
   const copy = document.createElement("div");
   copy.className = "file-copy";
 
   const name = document.createElement("span");
   name.className = "file-name";
-  name.title = item.file?.name || item.error || "오류";
-  name.textContent = item.file?.name || "사용할 수 없는 변환";
+  name.title = item.file ? item.relativePath || item.file.name : item.displayName || item.error || "오류";
+  name.textContent = item.file ? item.relativePath || item.file.name : item.displayName || "사용할 수 없는 변환";
 
   const meta = document.createElement("span");
   meta.className = "file-size";
@@ -478,7 +540,9 @@ function renderFileRow(item) {
       .filter(Boolean)
       .join(" · ");
   } else {
-    meta.textContent = `${formatBytes(item.file?.size || 0)} · ${labelForToken(state.preset.to)}로 변환`;
+    meta.textContent = usesBatchConversion()
+      ? `${formatBytes(item.file?.size || 0)} · 묶음 결과에 포함`
+      : `${formatBytes(item.file?.size || 0)} · ${labelForToken(state.preset.to)}로 변환`;
   }
   copy.append(name, meta);
 
@@ -576,13 +640,78 @@ async function convertOne(item) {
   }
 }
 
+async function convertBatch(items) {
+  for (const item of items) {
+    item.status = "converting";
+    item.progress = 8;
+    updateRow(item.id);
+  }
+
+  const timer = setInterval(() => {
+    for (const item of items) {
+      if (item.status === "converting") {
+        item.progress = Math.min(92, item.progress + 7);
+        updateRow(item.id);
+      }
+    }
+  }, 280);
+
+  const formData = new FormData();
+  for (const item of items) {
+    formData.append("file", item.file, item.file.name);
+    formData.append("relativePath", item.relativePath || item.file.name);
+  }
+  formData.append("target", state.preset.to);
+  if (state.preset.from === "image" && state.preset.to === "pdf") {
+    formData.append("pdfPageSize", pdfPageSize.value);
+    formData.append("pdfOrientation", pdfOrientation.value);
+    formData.append("pdfMargin", pdfMargin.value);
+  }
+
+  try {
+    const response = await fetch(apiUrl("/convert"), {
+      method: "POST",
+      body: formData,
+    });
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.error || "변환 실패");
+    state.files = [
+      {
+        id: fileRowId(),
+        file: null,
+        displayName: data.outputName || batchOutputLabel(),
+        displayExt: state.preset.to,
+        status: "done",
+        progress: 100,
+        result: data,
+        error: "",
+      },
+    ];
+  } catch (error) {
+    for (const item of items) {
+      item.status = "error";
+      item.error = error.message;
+      item.progress = 0;
+      updateRow(item.id);
+    }
+  } finally {
+    clearInterval(timer);
+    renderWorkspace();
+  }
+}
+
 async function convertSelectedFiles(event) {
   event.preventDefault();
   if (state.converting || !readyFiles().length) return;
   state.converting = true;
   renderWorkspace();
-  for (const item of [...readyFiles()]) {
-    await convertOne(item);
+  const items = [...readyFiles()];
+  if (usesBatchConversion()) {
+    await convertBatch(items);
+  } else {
+    for (const item of items) {
+      await convertOne(item);
+    }
   }
   state.converting = false;
   renderWorkspace();
@@ -592,6 +721,7 @@ function resetConversionState() {
   state.files = [];
   state.converting = false;
   fileInput.value = "";
+  folderInput.value = "";
   renderWorkspace();
 }
 
@@ -783,6 +913,68 @@ async function downloadZip() {
   }
 }
 
+function readDirectoryEntries(reader) {
+  return new Promise((resolve, reject) => {
+    const entries = [];
+    const readBatch = () => {
+      reader.readEntries((batch) => {
+        if (!batch.length) {
+          resolve(entries);
+          return;
+        }
+        entries.push(...batch);
+        readBatch();
+      }, reject);
+    };
+    readBatch();
+  });
+}
+
+function droppedEntryFile(entry) {
+  return new Promise((resolve, reject) => {
+    entry.file(resolve, reject);
+  });
+}
+
+async function collectDroppedEntry(entry, parentPath, files, relativePaths, limit) {
+  if (files.length >= limit) return;
+  const entryPath = parentPath ? `${parentPath}/${entry.name}` : entry.name;
+
+  if (entry.isFile) {
+    const file = await droppedEntryFile(entry);
+    files.push(file);
+    relativePaths.set(file, entry.fullPath ? entry.fullPath.replace(/^\/+/, "") : entryPath);
+    return;
+  }
+
+  if (!entry.isDirectory) return;
+  const entries = await readDirectoryEntries(entry.createReader());
+  for (const child of entries) {
+    await collectDroppedEntry(child, entryPath, files, relativePaths, limit);
+    if (files.length >= limit) return;
+  }
+}
+
+async function filesFromDrop(dataTransfer) {
+  const relativePaths = new Map();
+  const items = Array.from(dataTransfer?.items || []);
+  const entries = items
+    .map((item) => (typeof item.webkitGetAsEntry === "function" ? item.webkitGetAsEntry() : null))
+    .filter(Boolean);
+
+  if (!entries.length) {
+    return { files: Array.from(dataTransfer?.files || []), relativePaths };
+  }
+
+  const files = [];
+  const limit = Math.max(1, maxFileCount() - selectedFileCount() + 1);
+  for (const entry of entries) {
+    await collectDroppedEntry(entry, "", files, relativePaths, limit);
+    if (files.length >= limit) break;
+  }
+  return { files, relativePaths };
+}
+
 function setupDropzone(element) {
   for (const eventName of ["dragenter", "dragover"]) {
     element.addEventListener(eventName, (event) => {
@@ -796,7 +988,14 @@ function setupDropzone(element) {
       element.classList.remove("dragover");
     });
   }
-  element.addEventListener("drop", (event) => addFiles(event.dataTransfer.files));
+  element.addEventListener("drop", async (event) => {
+    try {
+      const dropped = await filesFromDrop(event.dataTransfer);
+      addFiles(dropped.files, dropped.relativePaths);
+    } catch (error) {
+      addInvalidFileMessage(`드롭한 폴더를 읽지 못했습니다: ${error.message}`);
+    }
+  });
   element.addEventListener("click", (event) => {
     if (event.target === fileInput) return;
     if (!state.converting) fileInput.click();
@@ -823,7 +1022,11 @@ setupDropzone(subDropzone);
 addMoreButton.addEventListener("click", () => {
   if (!state.converting) fileInput.click();
 });
+addFolderButton.addEventListener("click", () => {
+  if (!state.converting) folderInput.click();
+});
 fileInput.addEventListener("change", () => addFiles(fileInput.files));
+folderInput.addEventListener("change", () => addFiles(folderInput.files));
 controlSection.addEventListener("submit", convertSelectedFiles);
 resetButton.addEventListener("click", resetConversionState);
 downloadAllButton.addEventListener("click", downloadAll);

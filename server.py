@@ -95,6 +95,8 @@ MAX_PROCESS_MEMORY_BYTES = int(os.environ.get("FILE_TRANS_PROCESS_MEMORY", str(4
 MAX_PROCESS_FILES = int(os.environ.get("FILE_TRANS_PROCESS_FILES", "128"))
 MAX_PROCESS_COUNT = int(os.environ.get("FILE_TRANS_PROCESS_COUNT", "96"))
 MAX_CONCURRENT_CONVERSIONS = int(os.environ.get("FILE_TRANS_MAX_CONCURRENT", "2"))
+MAX_BATCH_FILES = int(os.environ.get("FILE_TRANS_MAX_BATCH_FILES", "30"))
+MAX_BATCH_UPLOAD_BYTES = int(os.environ.get("FILE_TRANS_MAX_BATCH_UPLOAD", str(512 * 1024 * 1024)))
 REQUEST_TIMEOUT_SECONDS = int(os.environ.get("FILE_TRANS_REQUEST_TIMEOUT", "30"))
 MAX_DATA_RECORDS = int(os.environ.get("FILE_TRANS_MAX_DATA_RECORDS", "100000"))
 MAX_ARCHIVE_MEMBERS = int(os.environ.get("FILE_TRANS_MAX_ARCHIVE_MEMBERS", "2000"))
@@ -249,6 +251,14 @@ class FileValidation:
     sha256: str
 
 
+@dataclass(frozen=True)
+class UploadedFile:
+    path: Path
+    original_name: str
+    archive_name: str
+    validation: FileValidation
+
+
 class UploadRateLimiter:
     def __init__(self, window_seconds: int, max_uploads: int):
         self.window_seconds = window_seconds
@@ -307,6 +317,42 @@ def stem_for_output(original_name: str) -> str:
     if len(stem) > limit:
         stem = stem[:limit]
     return stem or "converted"
+
+
+def sanitize_zip_entry_name(name: str, fallback: str) -> str:
+    raw = (name or fallback).replace("\\", "/").strip("/")
+    safe_parts = []
+    for part in raw.split("/"):
+        if not part or part == ".":
+            continue
+        if part == "..":
+            raise ConversionError("ZIP에 안전하지 않은 경로가 포함되어 있습니다.")
+        safe = sanitize_filename(part)
+        if safe in {"", ".", ".."}:
+            continue
+        safe_parts.append(safe)
+    if not safe_parts:
+        safe_parts.append(sanitize_filename(fallback))
+    return "/".join(safe_parts)
+
+
+def unique_archive_name(name: str, used_names: set[str]) -> str:
+    normalized = name.replace("\\", "/").strip("/")
+    if normalized not in used_names:
+        used_names.add(normalized)
+        return normalized
+
+    path = Path(normalized)
+    parent = "" if str(path.parent) == "." else f"{path.parent.as_posix()}/"
+    stem = path.stem or "file"
+    suffix = path.suffix
+    index = 2
+    while True:
+        candidate = f"{parent}{stem}-{index}{suffix}"
+        if candidate not in used_names:
+            used_names.add(candidate)
+            return candidate
+        index += 1
 
 
 def local_tool_path(*names: str) -> str | None:
@@ -484,7 +530,7 @@ def operations() -> list[dict]:
         {
             "id": "zip",
             "label": "파일 -> ZIP",
-            "from": sorted(ALLOWED_INPUT_EXTS),
+            "from": ["*"],
             "to": ["zip"],
             "engine": "python",
             "available": True,
@@ -496,7 +542,7 @@ def operations() -> list[dict]:
 def targets_for_extension(ext: str) -> list[str]:
     ext = ext.lower().lstrip(".")
     if ext not in ALLOWED_INPUT_EXTS:
-        return []
+        return ["zip"] if ext and EXT_RE.match(ext) else []
     targets = set()
     for op in operations():
         if "*" in op["from"] or ext in op["from"]:
@@ -522,6 +568,8 @@ def capabilities() -> dict:
         "maxProcessFiles": MAX_PROCESS_FILES,
         "maxProcessCount": MAX_PROCESS_COUNT,
         "maxConcurrentConversions": max(1, MAX_CONCURRENT_CONVERSIONS),
+        "maxBatchFiles": MAX_BATCH_FILES,
+        "maxBatchUploadBytes": MAX_BATCH_UPLOAD_BYTES,
         "requestTimeoutSeconds": REQUEST_TIMEOUT_SECONDS,
         "maxDataRecords": MAX_DATA_RECORDS,
         "maxArchiveMembers": MAX_ARCHIVE_MEMBERS,
@@ -1008,6 +1056,125 @@ def validate_upload_file(path: Path, original_name: str, size: int, digest: str)
     if ext in ZIP_EXTERNAL_REF_EXTS and zip_has_external_text_reference(path):
         raise ConversionError("외부 리소스를 참조하는 문서 컨테이너는 변환할 수 없습니다.")
     return FileValidation(ext=ext, detected=detected, size=size, sha256=digest)
+
+
+def validate_zip_upload_file(original_name: str, size: int, digest: str) -> FileValidation:
+    ext = Path(original_name).suffix.lower().lstrip(".")
+    if not ext or not EXT_RE.match(ext):
+        ext = "file"
+    if size > MAX_UPLOAD_BYTES:
+        raise ConversionError("업로드 용량 제한을 초과했습니다.")
+    return FileValidation(ext=ext, detected="raw", size=size, sha256=digest)
+
+
+def form_file_items(form: cgi.FieldStorage) -> list:
+    if "file" not in form:
+        return []
+    items = form["file"]
+    if not isinstance(items, list):
+        items = [items]
+    return [item for item in items if getattr(item, "filename", "")]
+
+
+def form_text_values(form: cgi.FieldStorage, name: str) -> list[str]:
+    if name not in form:
+        return []
+    values = form.getlist(name)
+    return [str(value) for value in values]
+
+
+def copy_and_validate_uploads(
+    file_items: list,
+    relative_paths: list[str],
+    job_upload_dir: Path,
+    target: str = "",
+) -> list[UploadedFile]:
+    if not file_items:
+        raise ConversionError("파일을 선택하세요.")
+    if len(file_items) > MAX_BATCH_FILES:
+        raise ConversionError(f"한 작업에는 최대 {MAX_BATCH_FILES}개까지 업로드할 수 있습니다.")
+
+    files: list[UploadedFile] = []
+    total_size = 0
+    used_archive_names: set[str] = set()
+    for index, file_item in enumerate(file_items, start=1):
+        original_name = sanitize_filename(file_item.filename)
+        source_ext = Path(original_name).suffix.lower().lstrip(".")
+        if target != "zip" and not source_ext:
+            raise ConversionError("확장자가 있는 파일만 업로드할 수 있습니다.")
+        safe_ext = source_ext if source_ext and EXT_RE.match(source_ext) else "bin"
+        input_path = job_upload_dir / f"input-{index:03d}.{safe_ext}"
+        size, digest = copy_stream_limited(file_item.file, input_path, MAX_UPLOAD_BYTES)
+        total_size += size
+        if total_size > MAX_BATCH_UPLOAD_BYTES:
+            raise ConversionError("한 번에 업로드한 파일 총량이 제한을 초과했습니다.")
+        validation = (
+            validate_zip_upload_file(original_name, size, digest)
+            if target == "zip"
+            else validate_upload_file(input_path, original_name, size, digest)
+        )
+        relative_name = relative_paths[index - 1] if index - 1 < len(relative_paths) else original_name
+        archive_name = unique_archive_name(
+            sanitize_zip_entry_name(relative_name, original_name),
+            used_archive_names,
+        )
+        files.append(UploadedFile(input_path, original_name, archive_name, validation))
+    return files
+
+
+def batch_file_validation(files: list[UploadedFile]) -> FileValidation:
+    digest = hashlib.sha256()
+    total_size = 0
+    for item in files:
+        digest.update(item.validation.sha256.encode("ascii"))
+        total_size += item.validation.size
+    ext = files[0].validation.ext if len(files) == 1 else "batch"
+    detected = files[0].validation.detected if len(files) == 1 else "multi"
+    return FileValidation(ext=ext, detected=detected, size=total_size, sha256=digest.hexdigest())
+
+
+def batch_output_name(files: list[UploadedFile], target: str) -> str:
+    if len(files) == 1:
+        return f"{stem_for_output(files[0].original_name)}.{target}"
+    if target == "zip":
+        return "files.zip"
+    if target == "pdf":
+        return "images.pdf"
+    return f"converted.{target}"
+
+
+def form_option(form: cgi.FieldStorage, name: str, allowed: set[str], default: str) -> str:
+    value = (form.getfirst(name) or default).lower().strip()
+    return value if value in allowed else default
+
+
+def convert_uploaded_files(
+    files: list[UploadedFile],
+    target: str,
+    job_output_dir: Path,
+    form: cgi.FieldStorage,
+) -> Path:
+    if target == "zip":
+        output_path = job_output_dir / batch_output_name(files, "zip")
+        zip_uploaded_files(files, output_path)
+    elif target == "pdf" and all(item.validation.ext in IMAGE_EXTS for item in files):
+        output_path = job_output_dir / batch_output_name(files, "pdf")
+        convert_images_to_pdf(
+            files,
+            output_path,
+            page_size=form_option(form, "pdfPageSize", {"fit", "a4", "letter"}, "fit"),
+            orientation=form_option(form, "pdfOrientation", {"auto", "portrait", "landscape"}, "auto"),
+            margin=form_option(form, "pdfMargin", {"none", "small", "large"}, "none"),
+        )
+    elif len(files) == 1:
+        item = files[0]
+        output_path = convert_file(item.path, item.original_name, target, job_output_dir)
+    else:
+        raise ConversionError("이 변환은 여러 파일을 하나의 결과로 합치는 방식을 지원하지 않습니다.")
+
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        raise ConversionError("변환 결과 파일이 생성되지 않았습니다.")
+    return output_path
 
 
 def metadata_path(job_output_dir: Path) -> Path:
@@ -1699,6 +1866,107 @@ def zip_single_file(input_path: Path, output_path: Path, original_name: str) -> 
         archive.write(input_path, arcname=original_name)
 
 
+def zip_uploaded_files(files: list[UploadedFile], output_path: Path) -> None:
+    if not files:
+        raise ConversionError("ZIP으로 묶을 파일을 선택하세요.")
+    used_names: set[str] = set()
+    with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for item in files:
+            archive.write(item.path, arcname=unique_archive_name(item.archive_name, used_names))
+
+
+def image_pdf_geometry(page_size: str, orientation: str, margin: str) -> tuple[int, int, int] | None:
+    if page_size == "fit":
+        return None
+    sizes = {
+        "a4": (1240, 1754),
+        "letter": (1275, 1650),
+    }
+    width, height = sizes.get(page_size, sizes["a4"])
+    if orientation == "landscape":
+        width, height = max(width, height), min(width, height)
+    elif orientation == "portrait":
+        width, height = min(width, height), max(width, height)
+    margins = {
+        "none": 0,
+        "small": 36,
+        "large": 72,
+    }
+    return width, height, margins.get(margin, 0)
+
+
+def convert_images_to_pdf(
+    files: list[UploadedFile],
+    output_path: Path,
+    page_size: str = "fit",
+    orientation: str = "auto",
+    margin: str = "none",
+) -> None:
+    if not files:
+        raise ConversionError("PDF로 합칠 이미지를 선택하세요.")
+    if not all(item.validation.ext in IMAGE_EXTS for item in files):
+        raise ConversionError("이미지 파일만 하나의 PDF로 합칠 수 있습니다.")
+
+    magick = tool_path("magick", "convert")
+    convert = None if magick else tool_path("convert")
+    if not magick and not convert:
+        raise ConversionError("ImageMagick이 설치되어 있지 않습니다. scripts/install-ubuntu-deps.sh를 실행하세요.")
+
+    limit_args = [
+        "-limit",
+        "time",
+        str(MAX_CONVERSION_SECONDS),
+        "-limit",
+        "memory",
+        "256MiB",
+        "-limit",
+        "map",
+        "512MiB",
+        "-limit",
+        "disk",
+        "1GiB",
+        "-limit",
+        "area",
+        "128MP",
+    ]
+    command = [magick or convert, *limit_args]
+    geometry = image_pdf_geometry(page_size, orientation, margin)
+    for item in files:
+        if geometry is None:
+            command.extend([str(item.path), "-auto-orient"])
+            continue
+        width, height, page_margin = geometry
+        content_width = max(1, width - (page_margin * 2))
+        content_height = max(1, height - (page_margin * 2))
+        command.extend(
+            [
+                "(",
+                str(item.path),
+                "-auto-orient",
+                "-resize",
+                f"{content_width}x{content_height}",
+                "-background",
+                "white",
+                "-gravity",
+                "center",
+                "-extent",
+                f"{width}x{height}",
+                ")",
+            ]
+        )
+    command.append(str(output_path))
+    run_checked(
+        command,
+        timeout=max(MAX_CONVERSION_SECONDS, 90),
+        cwd=output_path.parent,
+        docker_mounts=[(files[0].path.parent, "/input", "ro"), (output_path.parent, "/work", "rw")],
+        path_map={
+            **{item.path: f"/input/{item.path.name}" for item in files},
+            output_path: f"/work/{output_path.name}",
+        },
+    )
+
+
 def clean_process_output(text: str) -> str:
     text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]+", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
@@ -1776,6 +2044,8 @@ def conversion_env(extra_env: dict | None = None) -> dict:
         "LANG": os.environ.get("LANG", "C.UTF-8"),
         "LC_ALL": os.environ.get("LC_ALL", os.environ.get("LANG", "C.UTF-8")),
         "HOME": str(RUNTIME_HOME_DIR),
+        "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS", "1"),
+        "MAGICK_THREAD_LIMIT": os.environ.get("MAGICK_THREAD_LIMIT", "2"),
     }
     if IMAGEMAGICK_POLICY_DIR.exists():
         existing = os.environ.get("MAGICK_CONFIGURE_PATH")
@@ -2406,7 +2676,7 @@ class FileTransHandler(BaseHTTPRequestHandler):
         if content_length <= 0:
             self.send_error_json("업로드된 파일이 없습니다.")
             return
-        if content_length > MAX_UPLOAD_BYTES + MAX_MULTIPART_OVERHEAD_BYTES:
+        if content_length > MAX_BATCH_UPLOAD_BYTES + MAX_MULTIPART_OVERHEAD_BYTES:
             self.send_error_json("업로드 용량 제한을 초과했습니다.", HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
             return
         if "multipart/form-data" not in self.headers.get("Content-Type", ""):
@@ -2436,11 +2706,10 @@ class FileTransHandler(BaseHTTPRequestHandler):
         except (TimeoutError, socket.timeout, OSError):
             self.send_error_json("요청 본문을 읽는 시간이 초과되었습니다.", HTTPStatus.REQUEST_TIMEOUT)
             return
-        file_item = form["file"] if "file" in form else None
-        if isinstance(file_item, list):
-            file_item = file_item[0] if file_item else None
+        file_items = form_file_items(form)
+        relative_paths = form_text_values(form, "relativePath")
         target = (form.getfirst("target") or "").lower().strip()
-        if file_item is None or not getattr(file_item, "filename", ""):
+        if not file_items:
             self.send_error_json("파일을 선택하세요.")
             return
         if not target or not EXT_RE.match(target) or target not in ALLOWED_TARGET_EXTS:
@@ -2453,38 +2722,35 @@ class FileTransHandler(BaseHTTPRequestHandler):
         mkdir_private(job_upload_dir)
         mkdir_private(job_output_dir)
 
-        original_name = sanitize_filename(file_item.filename)
-        source_ext = Path(original_name).suffix.lower().lstrip(".")
-        if not source_ext:
-            remove_tree(job_upload_dir)
-            remove_tree(job_output_dir)
-            self.send_error_json("확장자가 있는 파일만 업로드할 수 있습니다.")
-            return
-        input_path = job_upload_dir / f"input.{source_ext}"
-
         error_message = None
         error_status = HTTPStatus.BAD_REQUEST
+        uploaded_files: list[UploadedFile] = []
         output_path = None
         metadata = None
         conversion_slot_acquired = False
         try:
-            size, digest = copy_stream_limited(file_item.file, input_path, MAX_UPLOAD_BYTES)
-            source = validate_upload_file(input_path, original_name, size, digest)
-            if source.ext == "hwp" and target == "pdf" and not hwp_filter_available():
+            uploaded_files = copy_and_validate_uploads(file_items, relative_paths, job_upload_dir, target)
+            if any(item.validation.ext == "hwp" for item in uploaded_files) and target == "pdf" and not hwp_filter_available():
                 raise ConversionError(
                     "HWP -> PDF 변환에는 LibreOffice HWP 필터가 필요합니다. "
                     "Ubuntu/WSL에서는 libreoffice-h2orestart 패키지를 설치한 뒤 백엔드를 재시작하세요."
                 )
-            if target not in targets_for_extension(source.ext):
-                raise ConversionError(f".{source.ext} 파일은 .{target} 형식으로 변환할 수 없습니다.")
+            unsupported = [
+                item.validation.ext
+                for item in uploaded_files
+                if target != "zip" and target not in targets_for_extension(item.validation.ext)
+            ]
+            if unsupported:
+                raise ConversionError(f".{unsupported[0]} 파일은 .{target} 형식으로 변환할 수 없습니다.")
             conversion_slot_acquired = conversion_slots.acquire(blocking=False)
             if not conversion_slot_acquired:
                 raise ConversionBusyError("동시 변환 제한에 도달했습니다. 잠시 후 다시 시도하세요.")
-            scan_upload_for_malware(input_path)
-            output_path = convert_file(input_path, original_name, target, job_output_dir)
+            for item in uploaded_files:
+                scan_upload_for_malware(item.path)
+            output_path = convert_uploaded_files(uploaded_files, target, job_output_dir, form)
             if output_path.stat().st_size > MAX_OUTPUT_BYTES:
                 raise ConversionError("변환 결과 파일 크기가 제한을 초과했습니다.")
-            metadata = create_download_metadata(job_id, output_path, source)
+            metadata = create_download_metadata(job_id, output_path, batch_file_validation(uploaded_files))
         except ConversionError as exc:
             remove_tree(job_output_dir)
             error_message = str(exc)
@@ -2497,7 +2763,6 @@ class FileTransHandler(BaseHTTPRequestHandler):
         finally:
             if conversion_slot_acquired:
                 conversion_slots.release()
-            safe_unlink(input_path)
             remove_tree(job_upload_dir)
 
         if error_message:
