@@ -53,10 +53,18 @@ assert "helpers" not in data
 assert not ({"g++", "java", "rust", "csharp"} & set(data["tools"]))
 assert isinstance(data["malwareScanEnabled"], bool)
 assert isinstance(data["malwareScanAvailable"], bool)
+assert isinstance(data["hwpFilterAvailable"], bool)
 assert data["inputFormatCount"] >= 40
 assert data["maxUploadBytes"] > 0
+assert data["maxMultipartOverheadBytes"] > 0
+assert data["maxOutputBytes"] > 0
 assert data["maxConversionSeconds"] > 0
+assert data["maxProcessMemoryBytes"] > 0
+assert data["maxProcessFiles"] > 0
+assert data["maxProcessCount"] > 0
 assert data["maxReferenceScanBytes"] > 0
+assert data["maxArchiveMembers"] > 0
+assert data["maxArchiveUncompressedBytes"] > 0
 '
 
 curl -fsS -D "${TMP_DIR}/headers.txt" "${BASE_URL}/" -o "${TMP_DIR}/index.html"
@@ -128,7 +136,10 @@ BAD_DOWNLOAD_STATUS="$(curl -sS -o "${TMP_DIR}/bad-download.txt" -w '%{http_code
 WRONG_NAME_URL="$(printf '%s' "${DOWNLOAD_URL}" | sed -E 's#/[^/]+$#/wrong-name.json#')"
 WRONG_NAME_STATUS="$(curl -sS -o "${TMP_DIR}/wrong-name.txt" -w '%{http_code}' "${BASE_URL}${WRONG_NAME_URL}")"
 [[ "${WRONG_NAME_STATUS}" == "404" ]]
-curl -fsS "${BASE_URL}${DOWNLOAD_URL}" -o "${TMP_DIR}/scores.json"
+curl -fsS -D "${TMP_DIR}/download-headers.txt" "${BASE_URL}${DOWNLOAD_URL}" -o "${TMP_DIR}/scores.json"
+grep -qi '^Content-Disposition: attachment;' "${TMP_DIR}/download-headers.txt"
+grep -qi '^Cache-Control: private, max-age=0, no-store' "${TMP_DIR}/download-headers.txt"
+grep -qi '^X-Content-Type-Options: nosniff' "${TMP_DIR}/download-headers.txt"
 grep -q '"name": "kim"' "${TMP_DIR}/scores.json"
 
 TSV_FILE="${TMP_DIR}/scores.tsv"

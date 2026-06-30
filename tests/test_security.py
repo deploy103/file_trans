@@ -2,6 +2,7 @@ import hashlib
 import os
 import stat
 import tempfile
+import time
 import unittest
 import zipfile
 from pathlib import Path
@@ -196,18 +197,37 @@ class SecurityValidationTests(unittest.TestCase):
         self.assertGreaterEqual(capabilities["maxFilenameChars"], 1)
         self.assertGreaterEqual(capabilities["maxConcurrentConversions"], 1)
         self.assertGreaterEqual(capabilities["requestTimeoutSeconds"], 1)
+        self.assertGreaterEqual(capabilities["maxMultipartOverheadBytes"], 0)
+        self.assertGreaterEqual(capabilities["maxOutputBytes"], 1)
+        self.assertGreaterEqual(capabilities["maxProcessMemoryBytes"], 1)
+        self.assertGreaterEqual(capabilities["maxProcessFiles"], 1)
+        self.assertGreaterEqual(capabilities["maxProcessCount"], 1)
         self.assertGreaterEqual(capabilities["maxDataRecords"], 1)
+        self.assertGreaterEqual(capabilities["maxArchiveMembers"], 1)
+        self.assertGreaterEqual(capabilities["maxArchiveUncompressedBytes"], 1)
         self.assertGreaterEqual(capabilities["cleanupIntervalSeconds"], 1)
         self.assertGreaterEqual(capabilities["maxReferenceScanBytes"], 1)
         self.assertIn("malwareScanEnabled", capabilities)
         self.assertIn("malwareScanAvailable", capabilities)
         self.assertGreaterEqual(capabilities["malwareScanTimeoutSeconds"], 1)
+        self.assertIn("hwpFilterAvailable", capabilities)
 
     def test_compilers_are_not_exposed_as_conversion_tools(self):
         capabilities = server.capabilities()
         exposed_tools = set(capabilities["tools"])
         self.assertFalse(exposed_tools & {"g++", "java", "rust", "csharp"})
         self.assertNotIn("helpers", capabilities)
+
+    def test_hwp_pdf_requires_hwp_filter_marker(self):
+        previous_marker = server.HWP_FILTER_MARKER
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                server.HWP_FILTER_MARKER = Path(tmp) / "missing-h2orestart.jar"
+                self.assertFalse(server.hwp_filter_available())
+                self.assertNotIn("pdf", server.targets_for_extension("hwp"))
+                self.assertIn("zip", server.targets_for_extension("hwp"))
+        finally:
+            server.HWP_FILTER_MARKER = previous_marker
 
     def test_http_server_uses_restart_friendly_defaults(self):
         self.assertTrue(server.FileTransServer.daemon_threads)
@@ -332,7 +352,7 @@ class SecurityValidationTests(unittest.TestCase):
                 (job_dir / "result.txt").write_text("old", encoding="utf-8")
                 server.write_json(job_dir / ".job.json", {"expiresAt": 0})
                 server.OUTPUT_DIR = output_dir
-                server.last_cleanup_at = 0
+                server.last_cleanup_at = time.monotonic() - server.CLEANUP_INTERVAL_SECONDS - 1
                 server.maybe_cleanup_expired_jobs()
                 self.assertFalse(job_dir.exists())
         finally:

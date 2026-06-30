@@ -57,6 +57,7 @@ make install-deps
 
 - `ffmpeg`: `mp4 -> mp3` 같은 영상/오디오 변환
 - `libreoffice`: `hwp`, `docx`, `pptx`, `xlsx` 같은 문서의 PDF 변환
+- `libreoffice-h2orestart`: LibreOffice의 HWP v5/HWPX import filter. 이 패키지가 없으면 `hwp -> pdf`는 비활성화됩니다.
 - `imagemagick`: 이미지 형식 변환
 - `ghostscript`, `poppler-utils`, `fonts-nanum`: PDF/이미지/한글 폰트 보강
 - `pandoc`: Markdown, reStructuredText, Org, LaTeX, Typst, Notebook 같은 마크업 문서 변환
@@ -84,15 +85,18 @@ Python만 있어도 `csv/tsv -> json`, `json/ndjson -> csv/tsv`, `srt <-> vtt`, 
 - 원본 파일은 UUID 작업 디렉터리에 임시 이름으로 저장하고 변환 후 삭제합니다.
 - 데이터 루트는 기본 `data/`이며 `FILE_TRANS_DATA_DIR`로 분리할 수 있습니다.
 - 파일명은 안전 문자로 정규화하고 기본 180자로 제한합니다.
+- 업로드 파일은 기본 100MiB로 제한하고, multipart 포장 overhead는 기본 1MiB까지 허용합니다.
 - 다운로드 URL은 작업 ID와 랜덤 토큰을 모두 요구합니다.
 - 브라우저의 명시적인 cross-site 변환 POST 요청은 `Origin`/`Sec-Fetch-Site` 검사로 차단합니다.
 - 프론트와 백엔드를 다른 포트로 띄울 때는 `FILE_TRANS_ALLOWED_ORIGINS`에 프론트 origin을 명시합니다.
-- 변환 프로세스는 timeout, 출력 크기 제한, stdin 차단, 제한된 환경변수로 실행됩니다.
+- 변환 프로세스는 timeout, 출력 크기 제한, stdin 차단, 제한된 환경변수, 가능한 OS 리소스 제한으로 실행됩니다.
 - 변환 프로세스의 `HOME`은 `data/runtime-home` 전용 디렉터리로 고정합니다.
 - 변환 도구 탐색/실행 `PATH`는 안전한 시스템 경로로 제한하며 `FILE_TRANS_CONVERT_PATH`로 조정할 수 있습니다.
+- HWP 바이너리 문서는 LibreOffice만으로 충분하지 않을 수 있어 `libreoffice-h2orestart` 필터가 설치된 경우에만 `hwp -> pdf`를 노출합니다.
 - 동시 변환 수는 기본 2개로 제한하며 `FILE_TRANS_MAX_CONCURRENT`로 조정할 수 있습니다.
 - 요청 읽기 timeout은 기본 30초이며 `FILE_TRANS_REQUEST_TIMEOUT`으로 조정할 수 있습니다.
 - 데이터 변환 레코드 수는 기본 100,000개로 제한하며 `FILE_TRANS_MAX_DATA_RECORDS`로 조정할 수 있습니다.
+- ZIP 기반 문서 컨테이너 검사는 기본 2,000개 member와 512MiB uncompressed 크기로 제한하며 `FILE_TRANS_MAX_ARCHIVE_MEMBERS`, `FILE_TRANS_MAX_ARCHIVE_UNCOMPRESSED`로 조정할 수 있습니다.
 - 문서 컨테이너 내부 외부 참조 검사 범위는 기본 20MiB이며 `FILE_TRANS_MAX_REFERENCE_SCAN`으로 조정할 수 있습니다.
 - 선택적으로 ClamAV `clamscan` 업로드 검사를 켤 수 있습니다: `FILE_TRANS_ENABLE_CLAMSCAN=1`.
 - 만료 결과 정리는 기본 10분 간격이며 `FILE_TRANS_CLEANUP_INTERVAL`로 조정할 수 있습니다.

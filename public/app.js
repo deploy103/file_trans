@@ -106,6 +106,7 @@ const state = {
 const toolPage = document.querySelector("#toolPage");
 const converterPage = document.querySelector("#converterPage");
 const toolGrid = document.querySelector("#toolGrid");
+const toolSubtitle = document.querySelector("#toolSubtitle");
 const uploadSection = document.querySelector("#uploadSection");
 const controlSection = document.querySelector("#convertForm");
 const dropzone = document.querySelector("#dropzone");
@@ -220,6 +221,7 @@ function toolLabel(name) {
   return {
     ffmpeg: "ffmpeg",
     libreoffice: "LibreOffice",
+    hwpfilter: "HWP 필터",
     imagemagick: "ImageMagick",
     poppler: "Poppler",
     pandoc: "Pandoc",
@@ -233,12 +235,18 @@ function renderTools() {
   for (const [name, ready] of Object.entries(tools)) {
     const badge = document.createElement("span");
     badge.className = `badge ${ready ? "ready" : "missing"}`;
-    badge.textContent = `${toolLabel(name)} ${ready ? "ready" : "missing"}`;
+    badge.textContent = `${toolLabel(name)} ${ready ? "사용 가능" : "없음"}`;
     toolStatus.appendChild(badge);
   }
 }
 
 function renderToolGrid() {
+  const inputCount = state.capabilities?.inputFormatCount || 0;
+  const targetCount = state.capabilities?.targetFormatCount || 0;
+  if (inputCount && targetCount) {
+    toolSubtitle.textContent = `현재 입력 형식 ${inputCount}개, 출력 형식 ${targetCount}개를 지원합니다. 원하는 작업을 선택하면 바로 변환 화면으로 이동합니다.`;
+  }
+
   toolGrid.replaceChildren();
   for (const group of TOOL_GROUPS) {
     const card = document.createElement("article");
@@ -313,8 +321,8 @@ function showConverter(preset) {
 
   const maxBytes = state.capabilities?.maxUploadBytes || 0;
   dropMeta.textContent = preset.from === "file"
-    ? `지원 형식 ${state.capabilities?.inputFormatCount || 0}개 이상 · 최대 ${formatBytes(maxBytes)}`
-    : `허용 입력: ${extList.slice(0, 8).map((ext) => `.${ext}`).join(", ")}${extList.length > 8 ? "..." : ""} · 최대 ${formatBytes(maxBytes)}`;
+    ? `지원 형식 ${state.capabilities?.inputFormatCount || 0}개 이상 · 파일당 최대 ${formatBytes(maxBytes)} · 최대 ${MAX_SELECTED_FILES}개`
+    : `허용 입력: ${extList.slice(0, 8).map((ext) => `.${ext}`).join(", ")}${extList.length > 8 ? "..." : ""} · 파일당 최대 ${formatBytes(maxBytes)} · 최대 ${MAX_SELECTED_FILES}개`;
 
   renderWorkspace();
   if (preset.unavailable || !toolAvailable(preset)) {

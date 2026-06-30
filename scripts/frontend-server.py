@@ -55,6 +55,18 @@ class FrontendHandler(SimpleHTTPRequestHandler):
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
         self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+        self.send_header("X-Permitted-Cross-Domain-Policies", "none")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; "
+            "connect-src 'self' http://127.0.0.1:* http://localhost:*; "
+            "img-src 'self' data:; "
+            "style-src 'self'; "
+            "script-src 'self'; "
+            "object-src 'none'; "
+            "base-uri 'none'; "
+            "frame-ancestors 'none'",
+        )
         super().end_headers()
 
     def send_head(self):  # noqa: N802 - stdlib API

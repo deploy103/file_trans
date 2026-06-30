@@ -59,6 +59,8 @@ grep -qi '^X-Frame-Options: DENY' "${TMP_DIR}/route-headers.txt"
 grep -qi '^Referrer-Policy: no-referrer' "${TMP_DIR}/route-headers.txt"
 grep -qi '^Permissions-Policy:' "${TMP_DIR}/route-headers.txt"
 grep -qi '^Cross-Origin-Resource-Policy: same-origin' "${TMP_DIR}/route-headers.txt"
+grep -qi '^X-Permitted-Cross-Domain-Policies: none' "${TMP_DIR}/route-headers.txt"
+grep -qi '^Content-Security-Policy:' "${TMP_DIR}/route-headers.txt"
 if grep -qi '^Server: .*Python' "${TMP_DIR}/route-headers.txt"; then
   echo "frontend Server header leaks Python version" >&2
   exit 1

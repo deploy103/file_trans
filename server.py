@@ -43,6 +43,12 @@ OUTPUT_DIR = DATA_DIR / "outputs"
 RUNTIME_HOME_DIR = DATA_DIR / "runtime-home"
 IMAGEMAGICK_POLICY_DIR = ROOT / "config" / "imagemagick"
 DEFAULT_CONVERSION_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+HWP_FILTER_MARKER = Path(
+    os.environ.get(
+        "FILE_TRANS_HWP_FILTER_MARKER",
+        "/usr/lib/libreoffice/share/extensions/h2orestart/H2Orestart.jar",
+    )
+)
 
 
 def normalize_conversion_path(value: str | None) -> str:
@@ -77,6 +83,10 @@ def parse_allowed_origins(value: str | None) -> set[str]:
 USE_DOCKER_WORKER = os.environ.get("FILE_TRANS_USE_DOCKER", "").lower() in {"1", "true", "yes", "on"}
 CONVERT_WORKER_IMAGE = os.environ.get("FILE_TRANS_WORKER_IMAGE", "file-trans-convert-worker:latest")
 MAX_UPLOAD_BYTES = int(os.environ.get("FILE_TRANS_MAX_UPLOAD", str(100 * 1024 * 1024)))
+MAX_MULTIPART_OVERHEAD_BYTES = max(
+    0,
+    int(os.environ.get("FILE_TRANS_MAX_MULTIPART_OVERHEAD", str(1024 * 1024))),
+)
 MAX_CONVERSION_SECONDS = int(os.environ.get("FILE_TRANS_CONVERT_TIMEOUT", "60"))
 RESULT_TTL_SECONDS = int(os.environ.get("FILE_TRANS_RESULT_TTL", str(24 * 60 * 60)))
 CLEANUP_INTERVAL_SECONDS = int(os.environ.get("FILE_TRANS_CLEANUP_INTERVAL", "600"))
@@ -327,6 +337,7 @@ def installed_tools() -> dict:
     return {
         "ffmpeg": tool_path("ffmpeg"),
         "libreoffice": tool_path("libreoffice", "soffice"),
+        "hwpfilter": str(HWP_FILTER_MARKER) if hwp_filter_available() else None,
         "imagemagick": tool_path("magick", "convert"),
         "poppler": tool_path("pdftoppm", "pdftotext"),
         "pandoc": tool_path("pandoc"),
@@ -338,15 +349,24 @@ def public_tool_status(values: dict) -> dict:
     return {name: bool(value) for name, value in values.items()}
 
 
+def hwp_filter_available() -> bool:
+    return HWP_FILTER_MARKER.exists()
+
+
 def operations() -> list[dict]:
     tools = installed_tools()
     has_ffmpeg = bool(tools["ffmpeg"])
     has_office = bool(tools["libreoffice"])
+    has_hwp_filter = bool(tools["hwpfilter"])
     has_image = bool(tools["imagemagick"])
     has_pdftoppm = bool(tool_path("pdftoppm"))
     has_pdftotext = bool(tool_path("pdftotext"))
     has_pandoc = bool(tools["pandoc"])
     has_calibre = bool(tools["calibre"])
+
+    document_pdf_inputs = set(DOCUMENT_EXTS - {"hwpx"})
+    if not has_hwp_filter:
+        document_pdf_inputs.discard("hwp")
 
     ops = [
         {
@@ -368,7 +388,7 @@ def operations() -> list[dict]:
         {
             "id": "document-pdf",
             "label": "Office/HWP -> PDF",
-            "from": sorted(DOCUMENT_EXTS - {"hwpx"}),
+            "from": sorted(document_pdf_inputs),
             "to": ["pdf"],
             "engine": "libreoffice",
             "available": has_office,
@@ -495,15 +515,23 @@ def capabilities() -> dict:
         "targetFormatCount": len(ALLOWED_TARGET_EXTS),
         "maxFilenameChars": MAX_FILENAME_CHARS,
         "maxUploadBytes": MAX_UPLOAD_BYTES,
+        "maxMultipartOverheadBytes": MAX_MULTIPART_OVERHEAD_BYTES,
+        "maxOutputBytes": MAX_OUTPUT_BYTES,
         "maxConversionSeconds": MAX_CONVERSION_SECONDS,
+        "maxProcessMemoryBytes": MAX_PROCESS_MEMORY_BYTES,
+        "maxProcessFiles": MAX_PROCESS_FILES,
+        "maxProcessCount": MAX_PROCESS_COUNT,
         "maxConcurrentConversions": max(1, MAX_CONCURRENT_CONVERSIONS),
         "requestTimeoutSeconds": REQUEST_TIMEOUT_SECONDS,
         "maxDataRecords": MAX_DATA_RECORDS,
+        "maxArchiveMembers": MAX_ARCHIVE_MEMBERS,
+        "maxArchiveUncompressedBytes": MAX_ARCHIVE_UNCOMPRESSED_BYTES,
         "cleanupIntervalSeconds": CLEANUP_INTERVAL_SECONDS,
         "maxReferenceScanBytes": MAX_REFERENCE_SCAN_BYTES,
         "malwareScanEnabled": ENABLE_CLAMSCAN,
         "malwareScanAvailable": bool(local_tool_path(CLAMSCAN_COMMAND)),
         "malwareScanTimeoutSeconds": CLAMSCAN_TIMEOUT_SECONDS,
+        "hwpFilterAvailable": hwp_filter_available(),
         "resultTtlSeconds": RESULT_TTL_SECONDS,
     }
 
@@ -2377,7 +2405,7 @@ class FileTransHandler(BaseHTTPRequestHandler):
         if content_length <= 0:
             self.send_error_json("업로드된 파일이 없습니다.")
             return
-        if content_length > MAX_UPLOAD_BYTES:
+        if content_length > MAX_UPLOAD_BYTES + MAX_MULTIPART_OVERHEAD_BYTES:
             self.send_error_json("업로드 용량 제한을 초과했습니다.", HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
             return
         if "multipart/form-data" not in self.headers.get("Content-Type", ""):
@@ -2441,6 +2469,11 @@ class FileTransHandler(BaseHTTPRequestHandler):
         try:
             size, digest = copy_stream_limited(file_item.file, input_path, MAX_UPLOAD_BYTES)
             source = validate_upload_file(input_path, original_name, size, digest)
+            if source.ext == "hwp" and target == "pdf" and not hwp_filter_available():
+                raise ConversionError(
+                    "HWP -> PDF 변환에는 LibreOffice HWP 필터가 필요합니다. "
+                    "Ubuntu/WSL에서는 libreoffice-h2orestart 패키지를 설치한 뒤 백엔드를 재시작하세요."
+                )
             if target not in targets_for_extension(source.ext):
                 raise ConversionError(f".{source.ext} 파일은 .{target} 형식으로 변환할 수 없습니다.")
             conversion_slot_acquired = conversion_slots.acquire(blocking=False)

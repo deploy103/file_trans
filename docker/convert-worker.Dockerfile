@@ -14,6 +14,7 @@ RUN apt-get update \
       ghostscript \
       imagemagick \
       libreoffice \
+      libreoffice-h2orestart \
       pandoc \
       poppler-utils \
       python3 \
