@@ -12,6 +12,7 @@ run-docker-worker:
 
 check:
 	python3 -m py_compile server.py
+	python3 -m unittest discover -s tests
 
 smoke-test:
 	bash scripts/smoke-test.sh
