@@ -1,23 +1,33 @@
 #!/usr/bin/env python3
 import csv
+import hashlib
 import html
 import json
 import mimetypes
 import os
 import re
+import secrets
+import signal
 import shutil
 import struct
 import subprocess
+import threading
 import time
 import unicodedata
 import uuid
 import warnings
 import zipfile
+from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import quote, unquote
 from xml.etree import ElementTree
+
+try:
+    import resource
+except ImportError:  # pragma: no cover - Windows fallback
+    resource = None
 
 warnings.filterwarnings("ignore", category=DeprecationWarning, message="'cgi' is deprecated.*")
 import cgi
@@ -29,7 +39,20 @@ DATA_DIR = ROOT / "data"
 UPLOAD_DIR = DATA_DIR / "uploads"
 OUTPUT_DIR = DATA_DIR / "outputs"
 BUILD_DIR = ROOT / "build"
-MAX_UPLOAD_BYTES = int(os.environ.get("FILE_TRANS_MAX_UPLOAD", str(512 * 1024 * 1024)))
+IMAGEMAGICK_POLICY_DIR = ROOT / "config" / "imagemagick"
+MAX_UPLOAD_BYTES = int(os.environ.get("FILE_TRANS_MAX_UPLOAD", str(100 * 1024 * 1024)))
+MAX_CONVERSION_SECONDS = int(os.environ.get("FILE_TRANS_CONVERT_TIMEOUT", "60"))
+RESULT_TTL_SECONDS = int(os.environ.get("FILE_TRANS_RESULT_TTL", str(24 * 60 * 60)))
+MAX_OUTPUT_BYTES = int(os.environ.get("FILE_TRANS_MAX_OUTPUT", str(1024 * 1024 * 1024)))
+MAX_PROCESS_MEMORY_BYTES = int(os.environ.get("FILE_TRANS_PROCESS_MEMORY", str(1024 * 1024 * 1024)))
+MAX_PROCESS_FILES = int(os.environ.get("FILE_TRANS_PROCESS_FILES", "128"))
+MAX_PROCESS_COUNT = int(os.environ.get("FILE_TRANS_PROCESS_COUNT", "96"))
+MAX_ARCHIVE_MEMBERS = int(os.environ.get("FILE_TRANS_MAX_ARCHIVE_MEMBERS", "2000"))
+MAX_ARCHIVE_UNCOMPRESSED_BYTES = int(
+    os.environ.get("FILE_TRANS_MAX_ARCHIVE_UNCOMPRESSED", str(512 * 1024 * 1024))
+)
+RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("FILE_TRANS_RATE_WINDOW", "600"))
+RATE_LIMIT_MAX_UPLOADS = int(os.environ.get("FILE_TRANS_RATE_MAX", "30"))
 HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -58,15 +81,55 @@ AUDIO_TARGETS = {"mp3", "wav", "aac", "m4a", "ogg", "flac", "opus"}
 VIDEO_TARGETS = {"mp4", "webm", "mov", "mkv", "gif"}
 IMAGE_TARGETS = {"jpg", "jpeg", "png", "webp", "gif", "bmp", "tiff", "pdf"}
 PDF_IMAGE_TARGETS = {"jpg", "jpeg", "png"}
+PDF_EXTS = {"pdf"}
+ALLOWED_INPUT_EXTS = DOCUMENT_EXTS | TEXT_EXTS | VIDEO_EXTS | AUDIO_EXTS | IMAGE_EXTS | PDF_EXTS
+ALLOWED_TARGET_EXTS = AUDIO_TARGETS | VIDEO_TARGETS | IMAGE_TARGETS | PDF_IMAGE_TARGETS | {"csv", "json", "html", "pdf", "zip"}
+TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{32,96}$")
+EXT_RE = re.compile(r"^[a-z0-9]{1,12}$")
+CHUNK_SIZE = 1024 * 1024
 
 
 class ConversionError(Exception):
     pass
 
 
+@dataclass(frozen=True)
+class FileValidation:
+    ext: str
+    detected: str
+    size: int
+    sha256: str
+
+
+class UploadRateLimiter:
+    def __init__(self, window_seconds: int, max_uploads: int):
+        self.window_seconds = window_seconds
+        self.max_uploads = max_uploads
+        self._lock = threading.Lock()
+        self._events: dict[str, list[float]] = {}
+
+    def allow(self, key: str) -> bool:
+        if self.max_uploads <= 0:
+            return True
+        now = time.monotonic()
+        cutoff = now - self.window_seconds
+        with self._lock:
+            events = [item for item in self._events.get(key, []) if item >= cutoff]
+            if len(events) >= self.max_uploads:
+                self._events[key] = events
+                return False
+            events.append(now)
+            self._events[key] = events
+            return True
+
+
+rate_limiter = UploadRateLimiter(RATE_LIMIT_WINDOW_SECONDS, RATE_LIMIT_MAX_UPLOADS)
+
+
 def ensure_dirs() -> None:
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    mkdir_private(UPLOAD_DIR)
+    mkdir_private(OUTPUT_DIR)
+    cleanup_expired_jobs()
 
 
 def sanitize_filename(name: str) -> str:
@@ -109,6 +172,10 @@ def built_helpers() -> dict:
         "csharp_probe": BUILD_DIR / "tools" / "fileprobe-cs.exe",
     }
     return {name: str(path) if path.exists() else None for name, path in helpers.items()}
+
+
+def public_tool_status(values: dict) -> dict:
+    return {name: bool(value) for name, value in values.items()}
 
 
 def operations() -> list[dict]:
@@ -193,7 +260,7 @@ def operations() -> list[dict]:
         {
             "id": "zip",
             "label": "파일 -> ZIP",
-            "from": ["*"],
+            "from": sorted(ALLOWED_INPUT_EXTS),
             "to": ["zip"],
             "engine": "python",
             "available": True,
@@ -204,6 +271,8 @@ def operations() -> list[dict]:
 
 def targets_for_extension(ext: str) -> list[str]:
     ext = ext.lower().lstrip(".")
+    if ext not in ALLOWED_INPUT_EXTS:
+        return []
     targets = set()
     for op in operations():
         if "*" in op["from"] or ext in op["from"]:
@@ -214,10 +283,12 @@ def targets_for_extension(ext: str) -> list[str]:
 
 def capabilities() -> dict:
     return {
-        "tools": installed_tools(),
-        "helpers": built_helpers(),
+        "tools": public_tool_status(installed_tools()),
+        "helpers": public_tool_status(built_helpers()),
         "operations": operations(),
         "maxUploadBytes": MAX_UPLOAD_BYTES,
+        "maxConversionSeconds": MAX_CONVERSION_SECONDS,
+        "resultTtlSeconds": RESULT_TTL_SECONDS,
     }
 
 
@@ -232,6 +303,291 @@ def read_text_file(path: Path) -> str:
 
 def write_json(path: Path, data) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def read_json(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def chmod_private(path: Path) -> None:
+    try:
+        path.chmod(0o700)
+    except OSError:
+        pass
+
+
+def mkdir_private(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    chmod_private(path)
+
+
+def safe_unlink(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def remove_tree(path: Path) -> None:
+    try:
+        shutil.rmtree(path)
+    except FileNotFoundError:
+        pass
+
+
+def cleanup_expired_jobs() -> None:
+    now = time.time()
+    for root in (UPLOAD_DIR, OUTPUT_DIR):
+        if not root.exists():
+            continue
+        for child in root.iterdir():
+            if not child.is_dir():
+                continue
+            metadata_path = child / ".job.json"
+            expires_at = None
+            if metadata_path.exists():
+                try:
+                    expires_at = float(read_json(metadata_path).get("expiresAt", 0))
+                except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                    expires_at = 0
+            else:
+                try:
+                    expires_at = child.stat().st_mtime + RESULT_TTL_SECONDS
+                except OSError:
+                    expires_at = 0
+            if expires_at and expires_at > now:
+                continue
+            remove_tree(child)
+
+
+def copy_stream_limited(source, output_path: Path, max_bytes: int) -> tuple[int, str]:
+    digest = hashlib.sha256()
+    total = 0
+    with output_path.open("wb") as handle:
+        while True:
+            chunk = source.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise ConversionError("업로드 용량 제한을 초과했습니다.")
+            digest.update(chunk)
+            handle.write(chunk)
+    if total <= 0:
+        raise ConversionError("빈 파일은 변환할 수 없습니다.")
+    return total, digest.hexdigest()
+
+
+def archive_names(path: Path) -> list[str]:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            infos = archive.infolist()
+    except zipfile.BadZipFile as exc:
+        raise ConversionError("ZIP 기반 문서 구조가 올바르지 않습니다.") from exc
+
+    if len(infos) > MAX_ARCHIVE_MEMBERS:
+        raise ConversionError("압축 컨테이너의 파일 수가 너무 많습니다.")
+
+    total_uncompressed = 0
+    names = []
+    for info in infos:
+        normalized = info.filename.replace("\\", "/")
+        parts = [part for part in normalized.split("/") if part]
+        if normalized.startswith("/") or any(part == ".." for part in parts):
+            raise ConversionError("압축 컨테이너에 안전하지 않은 경로가 포함되어 있습니다.")
+        total_uncompressed += info.file_size
+        if total_uncompressed > MAX_ARCHIVE_UNCOMPRESSED_BYTES:
+            raise ConversionError("압축 해제 예상 크기가 제한을 초과했습니다.")
+        names.append(normalized)
+    return names
+
+
+def zip_has_prefix(names: list[str], prefix: str) -> bool:
+    prefix = prefix.lower()
+    return any(name.lower().startswith(prefix) for name in names)
+
+
+def zip_has_name(names: list[str], expected: str) -> bool:
+    expected = expected.lower()
+    return any(name.lower() == expected for name in names)
+
+
+def text_decodes(sample: bytes) -> bool:
+    if b"\x00" in sample[:4096]:
+        return False
+    for encoding in ("utf-8-sig", "utf-8", "cp949", "euc-kr"):
+        try:
+            sample.decode(encoding)
+            return True
+        except UnicodeDecodeError:
+            continue
+    return False
+
+
+def is_text_like(path: Path) -> bool:
+    return text_decodes(path.read_bytes()[:8192])
+
+
+def is_json_like(path: Path) -> bool:
+    if not is_text_like(path):
+        return False
+    try:
+        json.loads(read_text_file(path))
+        return True
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        return False
+
+
+def is_xml_like(path: Path) -> bool:
+    sample = path.read_bytes()[:8192]
+    if not text_decodes(sample):
+        return False
+    stripped = sample.lstrip()
+    return stripped.startswith(b"<?xml") or stripped.startswith(b"<")
+
+
+def is_rtf_like(sample: bytes) -> bool:
+    return sample.startswith(b"{\\rtf")
+
+
+def is_mp4_like(sample: bytes, allowed_brands: set[str] | None = None) -> bool:
+    if len(sample) < 12 or sample[4:8] != b"ftyp":
+        return False
+    brands = {
+        sample[8:12].decode("latin-1", errors="ignore").strip(),
+        *[
+            sample[index : index + 4].decode("latin-1", errors="ignore").strip()
+            for index in range(16, min(len(sample), 96), 4)
+        ],
+    }
+    brands.discard("")
+    if allowed_brands is None:
+        return True
+    return bool(brands & allowed_brands)
+
+
+def detect_magic(path: Path, ext: str) -> str:
+    sample = path.read_bytes()[:8192]
+    lower_ext = ext.lower()
+    ole = sample.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")
+    signatures = {
+        "pdf": sample.startswith(b"%PDF-"),
+        "png": sample.startswith(b"\x89PNG\r\n\x1a\n"),
+        "jpg": sample.startswith(b"\xff\xd8\xff"),
+        "jpeg": sample.startswith(b"\xff\xd8\xff"),
+        "gif": sample.startswith((b"GIF87a", b"GIF89a")),
+        "bmp": sample.startswith(b"BM"),
+        "tif": sample.startswith((b"II*\x00", b"MM\x00*")),
+        "tiff": sample.startswith((b"II*\x00", b"MM\x00*")),
+        "webp": sample.startswith(b"RIFF") and sample[8:12] == b"WEBP",
+        "avi": sample.startswith(b"RIFF") and sample[8:12] == b"AVI ",
+        "wav": sample.startswith(b"RIFF") and sample[8:12] == b"WAVE",
+        "flac": sample.startswith(b"fLaC"),
+        "ogg": sample.startswith(b"OggS"),
+        "mp3": sample.startswith(b"ID3") or (len(sample) >= 2 and sample[0] == 0xFF and sample[1] & 0xE0 == 0xE0),
+        "aac": len(sample) >= 2 and sample[0] == 0xFF and sample[1] & 0xF0 == 0xF0,
+        "flv": sample.startswith(b"FLV"),
+        "mkv": sample.startswith(b"\x1a\x45\xdf\xa3"),
+        "webm": sample.startswith(b"\x1a\x45\xdf\xa3"),
+        "wma": sample.startswith(b"\x30\x26\xb2\x75\x8e\x66\xcf\x11\xa6\xd9\x00\xaa\x00\x62\xce\x6c"),
+        "wmv": sample.startswith(b"\x30\x26\xb2\x75\x8e\x66\xcf\x11\xa6\xd9\x00\xaa\x00\x62\xce\x6c"),
+        "hwp": ole,
+        "doc": ole,
+        "xls": ole,
+        "ppt": ole,
+        "rtf": is_rtf_like(sample),
+        "mp4": is_mp4_like(sample),
+        "mov": is_mp4_like(sample),
+        "m4v": is_mp4_like(sample),
+        "m4a": is_mp4_like(sample),
+        "heic": is_mp4_like(sample, {"heic", "heix", "hevc", "hevx", "mif1", "msf1"}),
+        "avif": is_mp4_like(sample, {"avif", "avis"}),
+    }
+    if lower_ext in signatures and signatures[lower_ext]:
+        return lower_ext
+
+    if lower_ext in {"docx", "pptx", "xlsx", "odt", "ods", "odp", "hwpx"} and sample.startswith(b"PK\x03\x04"):
+        names = archive_names(path)
+        if lower_ext == "docx" and zip_has_prefix(names, "word/"):
+            return "docx"
+        if lower_ext == "pptx" and zip_has_prefix(names, "ppt/"):
+            return "pptx"
+        if lower_ext == "xlsx" and zip_has_prefix(names, "xl/"):
+            return "xlsx"
+        if lower_ext == "hwpx" and (zip_has_prefix(names, "contents/") or zip_has_name(names, "mimetype")):
+            return "hwpx"
+        if lower_ext in {"odt", "ods", "odp"} and zip_has_name(names, "mimetype"):
+            return lower_ext
+
+    if lower_ext in {"txt", "md", "csv", "log", "srt", "vtt", "html", "htm"} and is_text_like(path):
+        return "text"
+    if lower_ext == "json" and is_json_like(path):
+        return "json"
+    if lower_ext == "xml" and is_xml_like(path):
+        return "xml"
+    return "unknown"
+
+
+def validate_upload_file(path: Path, original_name: str, size: int, digest: str) -> FileValidation:
+    ext = Path(original_name).suffix.lower().lstrip(".")
+    if not ext or not EXT_RE.match(ext):
+        raise ConversionError("확장자가 있는 파일만 업로드할 수 있습니다.")
+    if ext not in ALLOWED_INPUT_EXTS:
+        raise ConversionError(f".{ext} 파일은 업로드 허용 목록에 없습니다.")
+    if size > MAX_UPLOAD_BYTES:
+        raise ConversionError("업로드 용량 제한을 초과했습니다.")
+
+    detected = detect_magic(path, ext)
+    if detected == "unknown":
+        raise ConversionError("파일 내용이 확장자와 일치하지 않거나 지원하지 않는 형식입니다.")
+    return FileValidation(ext=ext, detected=detected, size=size, sha256=digest)
+
+
+def metadata_path(job_output_dir: Path) -> Path:
+    return job_output_dir / ".job.json"
+
+
+def create_download_metadata(
+    job_id: str,
+    output_path: Path,
+    original_name: str,
+    source: FileValidation,
+) -> dict:
+    token = secrets.token_urlsafe(32)
+    size = output_path.stat().st_size
+    with output_path.open("rb") as handle:
+        output_sha256 = hashlib.file_digest(handle, "sha256").hexdigest()
+    now = time.time()
+    metadata = {
+        "jobId": job_id,
+        "token": token,
+        "outputName": output_path.name,
+        "originalName": original_name,
+        "sourceExt": source.ext,
+        "sourceDetected": source.detected,
+        "sourceSize": source.size,
+        "sourceSha256": source.sha256,
+        "outputSize": size,
+        "outputSha256": output_sha256,
+        "createdAt": now,
+        "expiresAt": now + RESULT_TTL_SECONDS,
+    }
+    write_json(metadata_path(output_path.parent), metadata)
+    return metadata
+
+
+def load_download_metadata(job_id: str) -> dict | None:
+    if not re.fullmatch(r"[0-9a-f]{32}", job_id):
+        return None
+    path = OUTPUT_DIR / job_id / ".job.json"
+    try:
+        metadata = read_json(path)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if metadata.get("expiresAt", 0) < time.time():
+        remove_tree(path.parent)
+        return None
+    return metadata
 
 
 def convert_csv_to_json(input_path: Path, output_path: Path) -> None:
@@ -282,9 +638,17 @@ def local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1] if "}" in tag else tag
 
 
+def parse_safe_xml(data: bytes):
+    upper = data[:4096].upper()
+    if b"<!DOCTYPE" in upper or b"<!ENTITY" in upper:
+        raise ConversionError("DTD 또는 ENTITY가 포함된 XML은 처리하지 않습니다.")
+    return ElementTree.fromstring(data)
+
+
 def extract_hwpx_text(path: Path) -> str:
     paragraphs: list[str] = []
     try:
+        archive_names(path)
         with zipfile.ZipFile(path) as archive:
             xml_names = [
                 name
@@ -294,7 +658,7 @@ def extract_hwpx_text(path: Path) -> str:
             if not xml_names:
                 xml_names = [name for name in archive.namelist() if name.lower().endswith(".xml")]
             for name in sorted(xml_names):
-                root = ElementTree.fromstring(archive.read(name))
+                root = parse_safe_xml(archive.read(name))
                 section_paragraphs = []
                 for element in root.iter():
                     if local_name(element.tag) in {"p", "para", "paragraph"}:
@@ -309,13 +673,13 @@ def extract_hwpx_text(path: Path) -> str:
                     paragraphs.extend(section_paragraphs)
             if not paragraphs:
                 for name in sorted(xml_names):
-                    root = ElementTree.fromstring(archive.read(name))
+                    root = parse_safe_xml(archive.read(name))
                     paragraphs.extend(
                         element.text
                         for element in root.iter()
                         if local_name(element.tag) in {"t", "text"} and element.text
                     )
-    except (zipfile.BadZipFile, ElementTree.ParseError) as exc:
+    except (zipfile.BadZipFile, ElementTree.ParseError, ConversionError) as exc:
         raise ConversionError(f"HWPX 텍스트를 읽지 못했습니다: {exc}") from exc
     return "\n".join(paragraphs).strip()
 
@@ -769,24 +1133,93 @@ def zip_single_file(input_path: Path, output_path: Path, original_name: str) -> 
         archive.write(input_path, arcname=original_name)
 
 
-def run_checked(command: list[str], timeout: int = 900) -> subprocess.CompletedProcess:
+def clean_process_output(text: str) -> str:
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[-1200:] if text else "알 수 없는 변환 오류"
+
+
+def limited_preexec(timeout: int):
+    if resource is None or os.name != "posix":
+        return None
+
+    def apply_limits() -> None:
+        cpu_seconds = max(1, timeout + 5)
+        limits = [
+            (resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds + 5)),
+            (resource.RLIMIT_FSIZE, (MAX_OUTPUT_BYTES, MAX_OUTPUT_BYTES)),
+            (resource.RLIMIT_NOFILE, (MAX_PROCESS_FILES, MAX_PROCESS_FILES)),
+            (resource.RLIMIT_AS, (MAX_PROCESS_MEMORY_BYTES, MAX_PROCESS_MEMORY_BYTES)),
+        ]
+        if hasattr(resource, "RLIMIT_NPROC"):
+            limits.append((resource.RLIMIT_NPROC, (MAX_PROCESS_COUNT, MAX_PROCESS_COUNT)))
+        for limit_name, values in limits:
+            try:
+                resource.setrlimit(limit_name, values)
+            except (OSError, ValueError):
+                continue
+
+    return apply_limits
+
+
+def conversion_env(extra_env: dict | None = None) -> dict:
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "LC_ALL": os.environ.get("LC_ALL", os.environ.get("LANG", "C.UTF-8")),
+        "HOME": os.environ.get("HOME", str(DATA_DIR)),
+    }
+    if IMAGEMAGICK_POLICY_DIR.exists():
+        existing = os.environ.get("MAGICK_CONFIGURE_PATH")
+        env["MAGICK_CONFIGURE_PATH"] = (
+            f"{IMAGEMAGICK_POLICY_DIR}{os.pathsep}{existing}" if existing else str(IMAGEMAGICK_POLICY_DIR)
+        )
+    if extra_env:
+        env.update({key: str(value) for key, value in extra_env.items()})
+    return env
+
+
+def terminate_process_group(process: subprocess.Popen) -> None:
+    if os.name == "posix":
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+            return
+        except ProcessLookupError:
+            return
+        except OSError:
+            pass
+    process.kill()
+
+
+def run_checked(
+    command: list[str],
+    timeout: int = MAX_CONVERSION_SECONDS,
+    cwd: Path | None = None,
+    extra_env: dict | None = None,
+) -> subprocess.CompletedProcess:
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             command,
-            check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
             text=True,
-            timeout=timeout,
+            cwd=str(cwd) if cwd else None,
+            env=conversion_env(extra_env),
+            start_new_session=(os.name == "posix"),
+            preexec_fn=limited_preexec(timeout),
         )
     except FileNotFoundError as exc:
         raise ConversionError(f"실행 파일을 찾지 못했습니다: {command[0]}") from exc
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
+        terminate_process_group(process)
+        stdout, stderr = process.communicate()
         raise ConversionError("변환 시간이 초과되었습니다.") from exc
-    if result.returncode != 0:
-        message = (result.stderr or result.stdout or "알 수 없는 변환 오류").strip()
-        raise ConversionError(message[-1200:])
-    return result
+    if process.returncode != 0:
+        raise ConversionError(clean_process_output(stderr or stdout))
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
 def convert_with_ffmpeg(input_path: Path, output_path: Path, target: str) -> None:
@@ -794,7 +1227,7 @@ def convert_with_ffmpeg(input_path: Path, output_path: Path, target: str) -> Non
     if not ffmpeg:
         raise ConversionError("ffmpeg가 설치되어 있지 않습니다. scripts/install-ubuntu-deps.sh를 실행하세요.")
 
-    command = [ffmpeg, "-y", "-i", str(input_path)]
+    command = [ffmpeg, "-nostdin", "-hide_banner", "-v", "error", "-y", "-i", str(input_path)]
     if target in AUDIO_TARGETS:
         command.extend(["-vn", "-map_metadata", "-1"])
         if target == "mp3":
@@ -812,19 +1245,36 @@ def convert_with_ffmpeg(input_path: Path, output_path: Path, target: str) -> Non
     elif target == "gif":
         command.extend(["-vf", "fps=12,scale=960:-1:flags=lanczos"])
     command.append(str(output_path))
-    run_checked(command)
+    run_checked(command, cwd=output_path.parent)
 
 
 def convert_with_imagemagick(input_path: Path, output_path: Path) -> None:
     magick = tool_path("magick")
+    limit_args = [
+        "-limit",
+        "time",
+        str(MAX_CONVERSION_SECONDS),
+        "-limit",
+        "memory",
+        "256MiB",
+        "-limit",
+        "map",
+        "512MiB",
+        "-limit",
+        "disk",
+        "1GiB",
+        "-limit",
+        "area",
+        "128MP",
+    ]
     if magick:
-        command = [magick, str(input_path), str(output_path)]
+        command = [magick, *limit_args, str(input_path), str(output_path)]
     else:
         convert = tool_path("convert")
         if not convert:
             raise ConversionError("ImageMagick이 설치되어 있지 않습니다. scripts/install-ubuntu-deps.sh를 실행하세요.")
-        command = [convert, str(input_path), str(output_path)]
-    run_checked(command)
+        command = [convert, *limit_args, str(input_path), str(output_path)]
+    run_checked(command, cwd=output_path.parent)
 
 
 def convert_pdf_to_image(input_path: Path, output_path: Path, target: str) -> None:
@@ -836,7 +1286,7 @@ def convert_pdf_to_image(input_path: Path, output_path: Path, target: str) -> No
     command = [pdftoppm, "-singlefile", "-r", "160"]
     command.append("-jpeg" if target in {"jpg", "jpeg"} else "-png")
     command.extend([str(input_path), str(output_prefix)])
-    run_checked(command)
+    run_checked(command, cwd=output_path.parent)
 
     generated = output_prefix.with_suffix(".jpg" if target in {"jpg", "jpeg"} else ".png")
     if generated != output_path:
@@ -849,29 +1299,43 @@ def convert_with_libreoffice(input_path: Path, output_path: Path, target: str) -
         raise ConversionError("LibreOffice가 설치되어 있지 않습니다. scripts/install-ubuntu-deps.sh를 실행하세요.")
 
     outdir = output_path.parent
+    profile_dir = outdir / ".libreoffice-profile"
+    mkdir_private(profile_dir)
     command = [
         office,
         "--headless",
+        "--nologo",
+        "--nolockcheck",
+        "--nodefault",
+        "--nofirststartwizard",
+        f"-env:UserInstallation=file://{profile_dir.resolve()}",
         "--convert-to",
         target,
         "--outdir",
         str(outdir),
         str(input_path),
     ]
-    run_checked(command)
-    expected = outdir / f"{input_path.stem}.{target}"
-    if not expected.exists():
-        matches = sorted(outdir.glob(f"*.{target}"), key=lambda item: item.stat().st_mtime, reverse=True)
-        if not matches:
-            raise ConversionError("LibreOffice 변환 결과 파일을 찾지 못했습니다.")
-        expected = matches[0]
-    if expected != output_path:
-        expected.replace(output_path)
+    try:
+        run_checked(command, timeout=max(MAX_CONVERSION_SECONDS, 90), cwd=outdir, extra_env={"HOME": str(profile_dir)})
+        expected = outdir / f"{input_path.stem}.{target}"
+        if not expected.exists():
+            matches = sorted(outdir.glob(f"*.{target}"), key=lambda item: item.stat().st_mtime, reverse=True)
+            if not matches:
+                raise ConversionError("LibreOffice 변환 결과 파일을 찾지 못했습니다.")
+            expected = matches[0]
+        if expected != output_path:
+            expected.replace(output_path)
+    finally:
+        remove_tree(profile_dir)
 
 
 def convert_file(input_path: Path, original_name: str, target: str, job_output_dir: Path) -> Path:
     source_ext = input_path.suffix.lower().lstrip(".")
     target = target.lower().lstrip(".")
+    if source_ext not in ALLOWED_INPUT_EXTS:
+        raise ConversionError(f".{source_ext} 파일은 업로드 허용 목록에 없습니다.")
+    if not EXT_RE.match(target) or target not in ALLOWED_TARGET_EXTS:
+        raise ConversionError(f".{target} 출력 형식은 허용되지 않습니다.")
     allowed_targets = targets_for_extension(source_ext)
     if target not in allowed_targets:
         raise ConversionError(f".{source_ext} 파일은 .{target} 형식으로 변환할 수 없습니다.")
@@ -909,18 +1373,42 @@ class FileTransHandler(BaseHTTPRequestHandler):
     server_version = "FileTrans/0.1"
 
     def log_message(self, fmt: str, *args) -> None:
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {self.address_string()} {fmt % args}")
+        message = clean_process_output(fmt % args)
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {self.client_ip()} {message}")
+
+    def client_ip(self) -> str:
+        return self.client_address[0] if self.client_address else "unknown"
+
+    def send_security_headers(self) -> None:
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Security-Policy", "default-src 'self'; object-src 'none'; frame-ancestors 'none'")
 
     def send_json(self, payload: dict, status: HTTPStatus = HTTPStatus.OK) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        self.send_security_headers()
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(data)
 
     def send_error_json(self, message: str, status: HTTPStatus = HTTPStatus.BAD_REQUEST) -> None:
         self.send_json({"ok": False, "error": message}, status)
+
+    def send_error(self, code, message=None, explain=None) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        status = HTTPStatus(code)
+        text = message or status.phrase
+        data = f"{status.value} {text}\n".encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_security_headers()
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
 
     def do_GET(self) -> None:
         path = unquote(self.path.split("?", 1)[0])
@@ -955,16 +1443,25 @@ class FileTransHandler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
+        self.send_security_headers()
+        self.send_header("Cache-Control", "no-store" if file_path.name == "index.html" else "public, max-age=300")
         self.end_headers()
         self.wfile.write(data)
 
     def serve_download(self, request_path: str) -> None:
         parts = Path(request_path.lstrip("/")).parts
-        if len(parts) < 3:
+        if len(parts) < 4:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
-        _, job_id, *name_parts = parts
-        filename = sanitize_filename("/".join(name_parts))
+        _, job_id, token, *_name_parts = parts
+        if not TOKEN_RE.match(token):
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        metadata = load_download_metadata(job_id)
+        if not metadata or not secrets.compare_digest(str(metadata.get("token", "")), token):
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        filename = sanitize_filename(str(metadata.get("outputName", "download.bin")))
         file_path = OUTPUT_DIR / job_id / filename
         try:
             file_path.resolve().relative_to(OUTPUT_DIR.resolve())
@@ -974,22 +1471,31 @@ class FileTransHandler(BaseHTTPRequestHandler):
         if not file_path.exists() or not file_path.is_file():
             self.send_error(HTTPStatus.NOT_FOUND)
             return
+        if file_path.stat().st_size != int(metadata.get("outputSize", -1)):
+            self.send_error(HTTPStatus.GONE)
+            return
         content_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
-        data = file_path.read_bytes()
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Length", str(file_path.stat().st_size))
         fallback_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", file_path.name) or "download"
         encoded_name = quote(file_path.name)
         self.send_header(
             "Content-Disposition",
             f"attachment; filename=\"{fallback_name}\"; filename*=UTF-8''{encoded_name}",
         )
+        self.send_security_headers()
+        self.send_header("Cache-Control", "private, max-age=0, no-store")
         self.end_headers()
-        self.wfile.write(data)
+        with file_path.open("rb") as handle:
+            shutil.copyfileobj(handle, self.wfile, length=CHUNK_SIZE)
 
     def handle_convert(self) -> None:
-        content_length = int(self.headers.get("Content-Length", "0"))
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self.send_error_json("Content-Length가 올바르지 않습니다.")
+            return
         if content_length <= 0:
             self.send_error_json("업로드된 파일이 없습니다.")
             return
@@ -998,6 +1504,9 @@ class FileTransHandler(BaseHTTPRequestHandler):
             return
         if "multipart/form-data" not in self.headers.get("Content-Type", ""):
             self.send_error_json("multipart/form-data 요청만 지원합니다.")
+            return
+        if not rate_limiter.allow(self.client_ip()):
+            self.send_error_json("요청이 너무 많습니다. 잠시 후 다시 시도하세요.", HTTPStatus.TOO_MANY_REQUESTS)
             return
 
         form = cgi.FieldStorage(
@@ -1010,33 +1519,51 @@ class FileTransHandler(BaseHTTPRequestHandler):
             },
         )
         file_item = form["file"] if "file" in form else None
+        if isinstance(file_item, list):
+            file_item = file_item[0] if file_item else None
         target = (form.getfirst("target") or "").lower().strip()
         if file_item is None or not getattr(file_item, "filename", ""):
             self.send_error_json("파일을 선택하세요.")
             return
-        if not target:
+        if not target or not EXT_RE.match(target) or target not in ALLOWED_TARGET_EXTS:
             self.send_error_json("변환할 형식을 선택하세요.")
             return
 
         job_id = uuid.uuid4().hex
         job_upload_dir = UPLOAD_DIR / job_id
         job_output_dir = OUTPUT_DIR / job_id
-        job_upload_dir.mkdir(parents=True, exist_ok=True)
-        job_output_dir.mkdir(parents=True, exist_ok=True)
+        mkdir_private(job_upload_dir)
+        mkdir_private(job_output_dir)
 
         original_name = sanitize_filename(file_item.filename)
-        input_path = job_upload_dir / original_name
-        with input_path.open("wb") as handle:
-            shutil.copyfileobj(file_item.file, handle)
+        source_ext = Path(original_name).suffix.lower().lstrip(".")
+        if not source_ext:
+            remove_tree(job_upload_dir)
+            remove_tree(job_output_dir)
+            self.send_error_json("확장자가 있는 파일만 업로드할 수 있습니다.")
+            return
+        input_path = job_upload_dir / f"input.{source_ext}"
 
         try:
+            size, digest = copy_stream_limited(file_item.file, input_path, MAX_UPLOAD_BYTES)
+            source = validate_upload_file(input_path, original_name, size, digest)
+            if target not in targets_for_extension(source.ext):
+                raise ConversionError(f".{source.ext} 파일은 .{target} 형식으로 변환할 수 없습니다.")
             output_path = convert_file(input_path, original_name, target, job_output_dir)
+            if output_path.stat().st_size > MAX_OUTPUT_BYTES:
+                raise ConversionError("변환 결과 파일 크기가 제한을 초과했습니다.")
+            metadata = create_download_metadata(job_id, output_path, original_name, source)
         except ConversionError as exc:
+            remove_tree(job_output_dir)
             self.send_error_json(str(exc))
             return
         except Exception as exc:
+            remove_tree(job_output_dir)
             self.send_error_json(f"변환 중 오류가 발생했습니다: {exc}", HTTPStatus.INTERNAL_SERVER_ERROR)
             return
+        finally:
+            safe_unlink(input_path)
+            remove_tree(job_upload_dir)
 
         self.send_json(
             {
@@ -1044,7 +1571,8 @@ class FileTransHandler(BaseHTTPRequestHandler):
                 "jobId": job_id,
                 "outputName": output_path.name,
                 "size": output_path.stat().st_size,
-                "downloadUrl": f"/download/{job_id}/{output_path.name}",
+                "expiresAt": metadata["expiresAt"],
+                "downloadUrl": f"/download/{job_id}/{metadata['token']}/{quote(output_path.name)}",
             }
         )
 
