@@ -53,6 +53,7 @@ Python만 있어도 `csv/tsv -> json`, `json/ndjson -> csv/tsv`, `srt <-> vtt`, 
 - 변환 프로세스는 timeout, 출력 크기 제한, stdin 차단, 제한된 환경변수로 실행됩니다.
 - 동시 변환 수는 기본 2개로 제한하며 `FILE_TRANS_MAX_CONCURRENT`로 조정할 수 있습니다.
 - 요청 읽기 timeout은 기본 30초이며 `FILE_TRANS_REQUEST_TIMEOUT`으로 조정할 수 있습니다.
+- 데이터 변환 레코드 수는 기본 100,000개로 제한하며 `FILE_TRANS_MAX_DATA_RECORDS`로 조정할 수 있습니다.
 - ImageMagick은 `config/imagemagick/policy.xml` 정책을 사용합니다.
 - `data/`, `build/`, `deploy/`, `.env*`, `개발일지.md`, `요구사항`은 Git 추적에서 제외합니다.
 

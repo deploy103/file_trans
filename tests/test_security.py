@@ -44,6 +44,18 @@ class SecurityValidationTests(unittest.TestCase):
             self.assertIn("name,score", text)
             self.assertIn("lee,20", text)
 
+    def test_ndjson_record_limit_is_enforced(self):
+        previous = server.MAX_DATA_RECORDS
+        server.MAX_DATA_RECORDS = 1
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                input_path = Path(tmp) / "events.ndjson"
+                input_path.write_text('{"a":1}\n{"a":2}\n', encoding="utf-8")
+                with self.assertRaises(server.ConversionError):
+                    server.read_ndjson(input_path)
+        finally:
+            server.MAX_DATA_RECORDS = previous
+
     def test_srt_to_vtt(self):
         with tempfile.TemporaryDirectory() as tmp:
             input_path = Path(tmp) / "caption.srt"
@@ -60,6 +72,7 @@ class SecurityValidationTests(unittest.TestCase):
         self.assertGreaterEqual(capabilities["targetFormatCount"], 20)
         self.assertGreaterEqual(capabilities["maxConcurrentConversions"], 1)
         self.assertGreaterEqual(capabilities["requestTimeoutSeconds"], 1)
+        self.assertGreaterEqual(capabilities["maxDataRecords"], 1)
 
     def test_download_tokens_are_redacted_from_logs(self):
         text = (

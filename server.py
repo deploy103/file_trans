@@ -52,6 +52,7 @@ MAX_PROCESS_FILES = int(os.environ.get("FILE_TRANS_PROCESS_FILES", "128"))
 MAX_PROCESS_COUNT = int(os.environ.get("FILE_TRANS_PROCESS_COUNT", "96"))
 MAX_CONCURRENT_CONVERSIONS = int(os.environ.get("FILE_TRANS_MAX_CONCURRENT", "2"))
 REQUEST_TIMEOUT_SECONDS = int(os.environ.get("FILE_TRANS_REQUEST_TIMEOUT", "30"))
+MAX_DATA_RECORDS = int(os.environ.get("FILE_TRANS_MAX_DATA_RECORDS", "100000"))
 MAX_ARCHIVE_MEMBERS = int(os.environ.get("FILE_TRANS_MAX_ARCHIVE_MEMBERS", "2000"))
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = int(
     os.environ.get("FILE_TRANS_MAX_ARCHIVE_UNCOMPRESSED", str(512 * 1024 * 1024))
@@ -450,6 +451,7 @@ def capabilities() -> dict:
         "maxConversionSeconds": MAX_CONVERSION_SECONDS,
         "maxConcurrentConversions": max(1, MAX_CONCURRENT_CONVERSIONS),
         "requestTimeoutSeconds": REQUEST_TIMEOUT_SECONDS,
+        "maxDataRecords": MAX_DATA_RECORDS,
         "resultTtlSeconds": RESULT_TTL_SECONDS,
     }
 
@@ -856,9 +858,14 @@ def convert_delimited_to_json(input_path: Path, output_path: Path, delimiter: st
             dialect = csv.Sniffer().sniff(sample)
         except csv.Error:
             dialect = csv.excel
-        rows = list(csv.DictReader(text.splitlines(), dialect=dialect))
+        reader = csv.DictReader(text.splitlines(), dialect=dialect)
     else:
-        rows = list(csv.DictReader(text.splitlines(), delimiter=delimiter))
+        reader = csv.DictReader(text.splitlines(), delimiter=delimiter)
+    rows = []
+    for index, row in enumerate(reader, start=1):
+        if index > MAX_DATA_RECORDS:
+            raise ConversionError("데이터 레코드 수 제한을 초과했습니다.")
+        rows.append(row)
     write_json(output_path, rows)
 
 
@@ -875,6 +882,8 @@ def read_ndjson(input_path: Path) -> list:
     for line_no, line in enumerate(read_text_file(input_path).splitlines(), start=1):
         if not line.strip():
             continue
+        if len(records) >= MAX_DATA_RECORDS:
+            raise ConversionError("데이터 레코드 수 제한을 초과했습니다.")
         try:
             records.append(json.loads(line))
         except json.JSONDecodeError as exc:
@@ -896,6 +905,8 @@ def normalize_json_records(data):
         records = list_value if list_value is not None else [data]
     else:
         raise ConversionError("JSON 최상위 값은 객체 또는 객체 배열이어야 CSV로 변환할 수 있습니다.")
+    if len(records) > MAX_DATA_RECORDS:
+        raise ConversionError("데이터 레코드 수 제한을 초과했습니다.")
 
     normalized = []
     fieldnames: list[str] = []
