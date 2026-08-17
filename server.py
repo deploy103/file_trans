@@ -2956,6 +2956,9 @@ class FileTransHandler(BaseHTTPRequestHandler):
         if path.startswith("/download/"):
             self.serve_download(path)
             return
+        if re.fullmatch(r"/[a-z0-9]+to[a-z0-9]+/tran/?", path, re.IGNORECASE):
+            self.serve_static("/")
+            return
         self.serve_static(path)
 
     def do_POST(self) -> None:

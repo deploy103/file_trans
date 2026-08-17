@@ -82,6 +82,12 @@ if grep -qi '^Server: .*Python' "${TMP_DIR}/headers.txt"; then
   echo "Server header leaks Python version" >&2
   exit 1
 fi
+curl -fsS -D "${TMP_DIR}/route-headers.txt" "${BASE_URL}/csvtojson/tran" -o "${TMP_DIR}/route.html"
+grep -q '<title>File Trans</title>' "${TMP_DIR}/route.html"
+grep -qi '^Content-Type: text/html' "${TMP_DIR}/route-headers.txt"
+grep -qi '^Cache-Control: no-store' "${TMP_DIR}/route-headers.txt"
+INVALID_ROUTE_STATUS="$(curl -sS -o "${TMP_DIR}/invalid-route.txt" -w '%{http_code}' "${BASE_URL}/not-a-tool/tran")"
+[[ "${INVALID_ROUTE_STATUS}" == "404" ]]
 TRACE_STATUS="$(curl -sS -o "${TMP_DIR}/trace.txt" -w '%{http_code}' -X TRACE "${BASE_URL}/")"
 [[ "${TRACE_STATUS}" == "405" ]]
 PUT_STATUS="$(curl -sS -o "${TMP_DIR}/put.txt" -w '%{http_code}' -X PUT "${BASE_URL}/")"
