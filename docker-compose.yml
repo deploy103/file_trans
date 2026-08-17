@@ -1,0 +1,29 @@
+services:
+  app:
+    build:
+      context: .
+    restart: unless-stopped
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8000"
+      FILE_TRANS_DATA_DIR: /app/data
+      FILE_TRANS_MAX_UPLOAD: "${FILE_TRANS_MAX_UPLOAD:-104857600}"
+      FILE_TRANS_MAX_BATCH_UPLOAD: "${FILE_TRANS_MAX_BATCH_UPLOAD:-536870912}"
+      FILE_TRANS_CONVERT_TIMEOUT: "${FILE_TRANS_CONVERT_TIMEOUT:-60}"
+      FILE_TRANS_RESULT_TTL: "${FILE_TRANS_RESULT_TTL:-86400}"
+      FILE_TRANS_MAX_CONCURRENT: "${FILE_TRANS_MAX_CONCURRENT:-2}"
+    expose:
+      - "8000"
+    volumes:
+      - file_trans_data:/app/data
+    networks:
+      mvtp-web-net:
+        aliases:
+          - file-trans
+
+volumes:
+  file_trans_data:
+
+networks:
+  mvtp-web-net:
+    external: true
