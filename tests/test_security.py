@@ -1,12 +1,16 @@
 import hashlib
+import http.client
 import io
+import json
 import os
 import stat
 import tempfile
+import threading
 import time
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 import server
 
@@ -438,6 +442,147 @@ class SecurityValidationTests(unittest.TestCase):
                 self.assertIsNone(server.safe_public_file_path("/secret.txt"))
         finally:
             server.PUBLIC_DIR = previous_public_dir
+
+
+class DownloadContractTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        state = patch.multiple(
+            server,
+            OUTPUT_DIR=root / "outputs",
+            UPLOAD_DIR=root / "uploads",
+            ENABLE_CLAMSCAN=False,
+            rate_limiter=server.UploadRateLimiter(window_seconds=60, max_uploads=100),
+        )
+        state.start()
+        self.addCleanup(state.stop)
+        server.OUTPUT_DIR.mkdir()
+        server.UPLOAD_DIR.mkdir()
+        self.httpd = server.FileTransServer(("127.0.0.1", 0), server.FileTransHandler)
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        self.addCleanup(self.stop_server)
+
+    def stop_server(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.thread.join(timeout=2)
+
+    def request(self, method, path, body=None, headers=None):
+        connection = http.client.HTTPConnection("127.0.0.1", self.httpd.server_port, timeout=3)
+        try:
+            connection.request(method, path, body=body, headers=headers or {})
+            response = connection.getresponse()
+            return response.status, dict(response.getheaders()), response.read()
+        finally:
+            connection.close()
+
+    def convert_csv(self, filename):
+        boundary = "downloadContractBoundary"
+        body = (
+            f'--{boundary}\r\nContent-Disposition: form-data; name="target"\r\n\r\njson\r\n'
+            f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+            'Content-Type: text/csv\r\n\r\na,b\n1,2\n'
+            f'\r\n--{boundary}--\r\n'
+        ).encode()
+        status, _, content = self.request(
+            "POST", "/convert", body, {"Content-Type": f"multipart/form-data; boundary={boundary}"}
+        )
+        self.assertEqual(status, 200, content)
+        result = json.loads(content)
+        self.assertTrue(result["ok"])
+        return result
+
+    def test_converted_download_preserves_name_bytes_and_integrity(self):
+        expected = b'[\n  {\n    "a": "1",\n    "b": "2"\n  }\n]\n'
+        for original, output in (("ordinary.csv", "ordinary.json"), (".job.csv", ".job.json"), ("job.csv", "job.json")):
+            with self.subTest(original=original):
+                result = self.convert_csv(original)
+                self.assertEqual(result["outputName"], output)
+                self.assertEqual(result["size"], len(expected))
+                url = result["downloadUrl"]
+                status, headers, content = self.request("GET", url)
+                self.assertEqual(status, 200)
+                self.assertEqual(content, expected)
+                self.assertIn(f'filename="{output}"', headers["Content-Disposition"])
+                self.assertIn("no-store", headers["Cache-Control"])
+                job_dir = server.OUTPUT_DIR / result["jobId"]
+                metadata = server.read_json(server.metadata_path(job_dir))
+                self.assertEqual(metadata["outputSha256"], hashlib.sha256(expected).hexdigest())
+                self.assertEqual(metadata["outputSize"], len(expected))
+                self.assertEqual(metadata["expiresAt"], result["expiresAt"])
+                parts = url.split("/")
+                parts[3] = "A" * 43 if parts[3] != "A" * 43 else "B" * 43
+                self.assertEqual(self.request("GET", "/".join(parts))[0], 404)
+                output_path = job_dir / output
+                output_path.write_bytes(b"X" + expected[1:])
+                self.assertEqual(self.request("GET", url)[0], 410)
+                output_path.write_bytes(expected + b"X")
+                self.assertEqual(self.request("GET", url)[0], 410)
+                output_path.write_bytes(expected)
+                self.assertEqual(self.request("GET", url)[2], expected)
+                metadata_file = server.metadata_path(job_dir)
+                metadata_bytes = metadata_file.read_bytes()
+                metadata_file.unlink()
+                self.assertEqual(self.request("GET", url)[0], 404)
+                metadata_file.write_text("{", encoding="utf-8")
+                self.assertEqual(self.request("GET", url)[0], 404)
+                metadata_file.write_bytes(metadata_bytes)
+                self.assertEqual(self.request("GET", url)[2], expected)
+                metadata["expiresAt"] = time.time() - 1
+                server.write_json(server.metadata_path(job_dir), metadata)
+                self.assertEqual(self.request("GET", url)[0], 404)
+                self.assertFalse(job_dir.exists())
+        self.assertEqual(list(server.UPLOAD_DIR.iterdir()), [])
+
+    def test_legacy_download_and_expiry_remain_compatible(self):
+        payload = b"legacy result\n"
+        token = "L" * 43
+        for job_id, expired in (("a" * 32, False), ("b" * 32, True)):
+            job_dir = server.OUTPUT_DIR / job_id
+            job_dir.mkdir()
+            (job_dir / "legacy.txt").write_bytes(payload)
+            metadata_file = job_dir / ".job.json"
+            server.write_json(metadata_file, {
+                "jobId": job_id, "token": token, "outputName": "legacy.txt",
+                "outputSize": len(payload), "outputSha256": hashlib.sha256(payload).hexdigest(),
+                "expiresAt": time.time() + (-60 if expired else 3600),
+            })
+            original_metadata = metadata_file.read_bytes()
+            url = f"/download/{job_id}/{token}/legacy.txt"
+            status, _, content = self.request("GET", url)
+            if expired:
+                self.assertEqual(status, 404)
+                self.assertFalse(job_dir.exists())
+            else:
+                self.assertEqual((status, content), (200, payload))
+                self.assertEqual(self.request("GET", url.replace(token, "W" * 43))[0], 404)
+                (job_dir / "legacy.txt").write_bytes(b"X" + payload[1:])
+                self.assertEqual(self.request("GET", url)[0], 410)
+                (job_dir / "legacy.txt").write_bytes(payload)
+                server.cleanup_expired_jobs()
+                self.assertEqual(metadata_file.read_bytes(), original_metadata)
+                self.assertEqual({path.name for path in job_dir.iterdir()}, {"legacy.txt", ".job.json"})
+                metadata = server.read_json(metadata_file)
+                metadata["expiresAt"] = 0
+                server.write_json(metadata_file, metadata)
+                server.cleanup_expired_jobs()
+                self.assertFalse(job_dir.exists())
+
+    def test_cleanup_uses_metadata_not_result_filename(self):
+        result = self.convert_csv(".job.csv")
+        job_dir = server.OUTPUT_DIR / result["jobId"]
+        server.cleanup_expired_jobs()
+        self.assertTrue(job_dir.exists())
+        self.assertEqual(self.request("GET", result["downloadUrl"])[0], 200)
+        metadata = server.read_json(server.metadata_path(job_dir))
+        metadata["expiresAt"] = 0
+        server.write_json(server.metadata_path(job_dir), metadata)
+        with patch.object(server, "last_cleanup_at", time.monotonic() - server.CLEANUP_INTERVAL_SECONDS - 1):
+            server.maybe_cleanup_expired_jobs()
+        self.assertFalse(job_dir.exists())
 
 
 if __name__ == "__main__":

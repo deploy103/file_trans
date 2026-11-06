@@ -695,18 +695,15 @@ def cleanup_expired_jobs() -> None:
     for child in OUTPUT_DIR.iterdir():
         if not child.is_dir():
             continue
-        metadata_path = child / ".job.json"
-        expires_at = None
-        if metadata_path.exists():
-            try:
-                expires_at = float(read_json(metadata_path).get("expiresAt", 0))
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                expires_at = 0
-        else:
+        try:
+            expires_at = float(read_download_metadata(child).get("expiresAt", 0))
+        except FileNotFoundError:
             try:
                 expires_at = child.stat().st_mtime + RESULT_TTL_SECONDS
             except OSError:
                 expires_at = 0
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            expires_at = 0
         if expires_at and expires_at > now:
             continue
         remove_tree(child)
@@ -1351,7 +1348,15 @@ def convert_uploaded_files(
 
 
 def metadata_path(job_output_dir: Path) -> Path:
-    return job_output_dir / ".job.json"
+    return job_output_dir / ".metadata" / "job.json"
+
+
+def read_download_metadata(job_output_dir: Path) -> dict:
+    path = metadata_path(job_output_dir)
+    if path.parent.exists():
+        return read_json(path)
+    # Existing issued links keep their original metadata; no migration is needed.
+    return read_json(job_output_dir / ".job.json")
 
 
 def create_download_metadata(
@@ -1378,20 +1383,22 @@ def create_download_metadata(
         "createdAt": now,
         "expiresAt": now + RESULT_TTL_SECONDS,
     }
-    write_json(metadata_path(output_path.parent), metadata)
+    path = metadata_path(output_path.parent)
+    mkdir_private(path.parent)
+    write_json(path, metadata)
     return metadata
 
 
 def load_download_metadata(job_id: str) -> dict | None:
     if not re.fullmatch(r"[0-9a-f]{32}", job_id):
         return None
-    path = OUTPUT_DIR / job_id / ".job.json"
+    job_output_dir = OUTPUT_DIR / job_id
     try:
-        metadata = read_json(path)
+        metadata = read_download_metadata(job_output_dir)
     except (OSError, json.JSONDecodeError):
         return None
     if metadata.get("expiresAt", 0) < time.time():
-        remove_tree(path.parent)
+        remove_tree(job_output_dir)
         return None
     return metadata
 
